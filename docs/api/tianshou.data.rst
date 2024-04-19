@@ -30,6 +30,14 @@ PrioritizedReplayBuffer
    :undoc-members:
    :show-inheritance:
 
+HERReplayBuffer
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: tianshou.data.HERReplayBuffer
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 ReplayBufferManager
 ~~~~~~~~~~~~~~~~~~~
 
@@ -46,6 +54,15 @@ PrioritizedReplayBufferManager
    :undoc-members:
    :show-inheritance:
 
+
+HERReplayBufferManager
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: tianshou.data.HERReplayBufferManager
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 VectorReplayBuffer
 ~~~~~~~~~~~~~~~~~~
 
@@ -58,6 +75,14 @@ PrioritizedVectorReplayBuffer
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autoclass:: tianshou.data.PrioritizedVectorReplayBuffer
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+HERVectorReplayBuffer
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: tianshou.data.HERVectorReplayBuffer
    :members:
    :undoc-members:
    :show-inheritance:
@@ -85,6 +110,33 @@ AsyncCollector
 ~~~~~~~~~~~~~~
 
 .. autoclass:: tianshou.data.AsyncCollector
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+
+Utils
+-----
+
+to_numpy
+~~~~~~~~
+
+.. autofunction:: tianshou.data.to_numpy
+
+to_torch
+~~~~~~~~
+
+.. autofunction:: tianshou.data.to_torch
+
+to_torch_as
+~~~~~~~~~~~
+
+.. autofunction:: tianshou.data.to_torch_as
+
+SegmentTree
+~~~~~~~~~~~
+
+.. autoclass:: tianshou.data.SegmentTree
    :members:
    :undoc-members:
    :show-inheritance:

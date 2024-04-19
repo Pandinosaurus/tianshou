@@ -4,13 +4,13 @@ import os
 import pickle
 import pprint
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from tianshou.data import Collector
-from tianshou.env import SubprocVectorEnv
+from tianshou.data import Collector, VectorReplayBuffer
+from tianshou.env import DummyVectorEnv
 from tianshou.policy import BCQPolicy
 from tianshou.trainer import offline_trainer
 from tianshou.utils import TensorboardLogger
@@ -18,26 +18,27 @@ from tianshou.utils.net.common import MLP, Net
 from tianshou.utils.net.continuous import VAE, Critic, Perturbation
 
 if __name__ == "__main__":
-    from gather_pendulum_data import gather_data
+    from gather_pendulum_data import expert_file_name, gather_data
 else:  # pytest
-    from test.offline.gather_pendulum_data import gather_data
+    from test.offline.gather_pendulum_data import expert_file_name, gather_data
 
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--task', type=str, default='Pendulum-v0')
+    parser.add_argument('--task', type=str, default='Pendulum-v1')
+    parser.add_argument('--reward-threshold', type=float, default=None)
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--hidden-sizes', type=int, nargs='*', default=[200, 150])
+    parser.add_argument('--hidden-sizes', type=int, nargs='*', default=[64])
     parser.add_argument('--actor-lr', type=float, default=1e-3)
     parser.add_argument('--critic-lr', type=float, default=1e-3)
-    parser.add_argument('--epoch', type=int, default=7)
-    parser.add_argument('--step-per-epoch', type=int, default=2000)
-    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--epoch', type=int, default=5)
+    parser.add_argument('--step-per-epoch', type=int, default=500)
+    parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--test-num', type=int, default=10)
     parser.add_argument('--logdir', type=str, default='log')
-    parser.add_argument('--render', type=float, default=0.)
+    parser.add_argument('--render', type=float, default=1 / 35)
 
-    parser.add_argument("--vae-hidden-sizes", type=int, nargs='*', default=[375, 375])
+    parser.add_argument("--vae-hidden-sizes", type=int, nargs='*', default=[32, 32])
     # default to 2 * action_dim
     parser.add_argument('--latent_dim', type=int, default=None)
     parser.add_argument("--gamma", default=0.99)
@@ -56,29 +57,35 @@ def get_args():
         action='store_true',
         help='watch the play of pre-trained policy only',
     )
-    parser.add_argument(
-        "--load-buffer-name", type=str, default="./expert_SAC_Pendulum-v0.pkl"
-    )
+    parser.add_argument("--load-buffer-name", type=str, default=expert_file_name())
+    parser.add_argument("--show-progress", action="store_true")
     args = parser.parse_known_args()[0]
     return args
 
 
 def test_bcq(args=get_args()):
     if os.path.exists(args.load_buffer_name) and os.path.isfile(args.load_buffer_name):
-        buffer = pickle.load(open(args.load_buffer_name, "rb"))
+        if args.load_buffer_name.endswith(".hdf5"):
+            buffer = VectorReplayBuffer.load_hdf5(args.load_buffer_name)
+        else:
+            buffer = pickle.load(open(args.load_buffer_name, "rb"))
     else:
         buffer = gather_data()
     env = gym.make(args.task)
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
     args.max_action = env.action_space.high[0]  # float
-    if args.task == 'Pendulum-v0':
-        env.spec.reward_threshold = -800  # too low?
+    if args.reward_threshold is None:
+        # too low?
+        default_reward_threshold = {"Pendulum-v0": -1100, "Pendulum-v1": -1100}
+        args.reward_threshold = default_reward_threshold.get(
+            args.task, env.spec.reward_threshold
+        )
 
     args.state_dim = args.state_shape[0]
     args.action_dim = args.action_shape[0]
     # test_envs = gym.make(args.task)
-    test_envs = SubprocVectorEnv(
+    test_envs = DummyVectorEnv(
         [lambda: gym.make(args.task) for _ in range(args.test_num)]
     )
     # seed
@@ -175,11 +182,11 @@ def test_bcq(args=get_args()):
     writer.add_text("args", str(args))
     logger = TensorboardLogger(writer)
 
-    def save_fn(policy):
+    def save_best_fn(policy):
         torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
 
     def stop_fn(mean_rewards):
-        return mean_rewards >= env.spec.reward_threshold
+        return mean_rewards >= args.reward_threshold
 
     def watch():
         policy.load_state_dict(
@@ -200,9 +207,10 @@ def test_bcq(args=get_args()):
         args.step_per_epoch,
         args.test_num,
         args.batch_size,
-        save_fn=save_fn,
+        save_best_fn=save_best_fn,
         stop_fn=stop_fn,
         logger=logger,
+        show_progress=args.show_progress,
     )
     assert stop_fn(result['best_reward'])
 

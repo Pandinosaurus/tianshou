@@ -1,14 +1,24 @@
-from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Optional, Tuple, Union
-
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
-from gym.spaces import Box, Discrete, MultiBinary, MultiDiscrete
+from abc import ABC, abstractmethod
+from gymnasium.spaces import Box, Discrete, MultiBinary, MultiDiscrete
 from numba import njit
 from torch import nn
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 from tianshou.data import Batch, ReplayBuffer, to_numpy, to_torch_as
+from tianshou.data.batch import BatchProtocol
+from tianshou.utils import MultipleLRSchedulers
+
+
+class RolloutBatchProtocol(BatchProtocol):
+    obs: torch.Tensor
+    obs_next: torch.Tensor
+    info: Dict[str, Any]
+    rew: np.ndarray
+    terminated: torch.Tensor
+    truncated: torch.Tensor
 
 
 class BasePolicy(ABC, nn.Module):
@@ -63,30 +73,54 @@ class BasePolicy(ABC, nn.Module):
         observation_space: Optional[gym.Space] = None,
         action_space: Optional[gym.Space] = None,
         action_scaling: bool = False,
-        action_bound_method: str = "",
+        action_bound_method: Optional[Literal["clip", "tanh"]] = None,
+        lr_scheduler: Optional[
+            Union[torch.optim.lr_scheduler.LambdaLR, MultipleLRSchedulers]
+        ] = None,
     ) -> None:
+        """
+        :param observation_space: appears unused!
+        :param action_space: required for action_scaling.
+        :param action_scaling: if True, scale the action from [-1, 1] to the range
+            of action_space. Note that in this case, the action_space must be provided!
+        :param action_bound_method:
+        :param lr_scheduler:
+        """
+        if action_bound_method is not None:
+            assert action_bound_method in ("clip", "tanh")
+        # Happens for vector envs
+        # TODO: was this required before? Look into it
+        if isinstance(action_space, list):
+            action_space = action_space[0]
+        if action_scaling and not isinstance(action_space, Box):
+            raise ValueError(
+                f"action_scaling can only be True when action_space is Box but "
+                f"got: {action_space}"
+            )
+
         super().__init__()
         self.observation_space = observation_space
         self.action_space = action_space
-        self.action_type = ""
         if isinstance(action_space, (Discrete, MultiDiscrete, MultiBinary)):
             self.action_type = "discrete"
         elif isinstance(action_space, Box):
             self.action_type = "continuous"
+        else:
+            ValueError(f"Unsupported action space: {action_space}.")
         self.agent_id = 0
         self.updating = False
         self.action_scaling = action_scaling
-        # can be one of ("clip", "tanh", ""), empty string means no bounding
-        assert action_bound_method in ("", "clip", "tanh")
         self.action_bound_method = action_bound_method
+        self.lr_scheduler = lr_scheduler
         self._compile()
 
     def set_agent_id(self, agent_id: int) -> None:
         """Set self.agent_id = agent_id, for MARL."""
         self.agent_id = agent_id
 
-    def exploration_noise(self, act: Union[np.ndarray, Batch],
-                          batch: Batch) -> Union[np.ndarray, Batch]:
+    def exploration_noise(
+        self, act: Union[np.ndarray, Batch], batch: Batch
+    ) -> Union[np.ndarray, Batch]:
         """Modify the action from policy.forward with exploration noise.
 
         :param act: a data batch or numpy.ndarray which is the action taken by
@@ -164,18 +198,47 @@ class BasePolicy(ABC, nn.Module):
         :return: action in the same form of input "act" but remap to the target action
             space.
         """
-        if isinstance(self.action_space, gym.spaces.Box) and \
-                isinstance(act, np.ndarray):
+        if isinstance(self.action_space, gym.spaces.Box) and isinstance(
+            act, np.ndarray
+        ):
             # currently this action mapping only supports np.ndarray action
             if self.action_bound_method == "clip":
                 act = np.clip(act, -1.0, 1.0)
             elif self.action_bound_method == "tanh":
                 act = np.tanh(act)
             if self.action_scaling:
-                assert np.min(act) >= -1.0 and np.max(act) <= 1.0, \
-                    "action scaling only accepts raw action range = [-1, 1]"
+                assert (
+                    np.min(act) >= -1.0 and np.max(act) <= 1.0
+                ), "action scaling only accepts raw action range = [-1, 1]"
                 low, high = self.action_space.low, self.action_space.high
                 act = low + (high - low) * (act + 1.0) / 2.0  # type: ignore
+        return act
+
+    def map_action_inverse(
+        self, act: Union[Batch, List, np.ndarray]
+    ) -> Union[Batch, List, np.ndarray]:
+        """Inverse operation to :meth:`~tianshou.policy.BasePolicy.map_action`.
+
+        This function is called in :meth:`~tianshou.data.Collector.collect` for
+        random initial steps. It scales [action_space.low, action_space.high] to
+        the value ranges of policy.forward.
+
+        :param act: a data batch, list or numpy.ndarray which is the action taken
+            by gym.spaces.Box.sample().
+
+        :return: action remapped.
+        """
+        if isinstance(self.action_space, gym.spaces.Box):
+            act = to_numpy(act)
+            if isinstance(act, np.ndarray):
+                if self.action_scaling:
+                    low, high = self.action_space.low, self.action_space.high
+                    scale = high - low
+                    eps = np.finfo(np.float32).eps.item()
+                    scale[scale < eps] += eps
+                    act = (act - low) * 2.0 / scale - 1.0
+                if self.action_bound_method == "tanh":
+                    act = (np.log(1.0 + act) - np.log(1.0 - act)) / 2.0  # type: ignore
         return act
 
     def process_fn(
@@ -222,8 +285,9 @@ class BasePolicy(ABC, nn.Module):
         if hasattr(buffer, "update_weight") and hasattr(batch, "weight"):
             buffer.update_weight(indices, batch.weight)
 
-    def update(self, sample_size: int, buffer: Optional[ReplayBuffer],
-               **kwargs: Any) -> Dict[str, Any]:
+    def update(
+        self, sample_size: int, buffer: Optional[ReplayBuffer], **kwargs: Any
+    ) -> Dict[str, Any]:
         """Update the policy network and replay buffer.
 
         It includes 3 function steps: process_fn, learn, and post_process_fn. In
@@ -245,6 +309,8 @@ class BasePolicy(ABC, nn.Module):
         batch = self.process_fn(batch, buffer, indices)
         result = self.learn(batch, **kwargs)
         self.post_process_fn(batch, buffer, indices)
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
         self.updating = False
         return result
 
@@ -266,16 +332,11 @@ class BasePolicy(ABC, nn.Module):
         :return: A bool type numpy.ndarray in the same shape with indices. "True" means
             "obs_next" of that buffer[indices] is valid.
         """
-        mask = ~buffer.done[indices]
-        # info["TimeLimit.truncated"] will be True if "done" flag is generated by
-        # timelimit of environments. Checkout gym.wrappers.TimeLimit.
-        if hasattr(buffer, 'info') and 'TimeLimit.truncated' in buffer.info:
-            mask = mask | buffer.info['TimeLimit.truncated'][indices]
-        return mask
+        return ~buffer.terminated[indices]
 
     @staticmethod
     def compute_episodic_return(
-        batch: Batch,
+        batch: RolloutBatchProtocol,
         buffer: ReplayBuffer,
         indices: np.ndarray,
         v_s_: Optional[Union[np.ndarray, torch.Tensor]] = None,
@@ -286,18 +347,23 @@ class BasePolicy(ABC, nn.Module):
         """Compute returns over given batch.
 
         Use Implementation of Generalized Advantage Estimator (arXiv:1506.02438)
-        to calculate q/advantage value of given batch.
+        to calculate q/advantage value of given batch. Returns are calculated as
+        advantage + value, which is exactly equivalent to using TD(gae_lambda)
+        for estimating returns.
 
-        :param Batch batch: a data batch which contains several episodes of data in
+        :param batch: a data batch which contains several episodes of data in
             sequential order. Mind that the end of each finished episode of batch
             should be marked by done flag, unfinished (or collecting) episodes will be
             recognized by buffer.unfinished_index().
+        :param buffer: the corresponding replay buffer.
         :param numpy.ndarray indices: tell batch's location in buffer, batch is equal
             to buffer[indices].
         :param np.ndarray v_s_: the value function of all next states :math:`V(s')`.
+            If None, it will be set to an array of 0.
+        :param v_s: the value function of all current states :math:`V(s)`.
         :param float gamma: the discount factor, should be in [0, 1]. Default to 0.99.
         :param float gae_lambda: the parameter for Generalized Advantage Estimation,
-            should be in [0, 1]. Default to 0.95.
+            # should be in [0, 1]. Default to 0.95.
 
         :return: two numpy arrays (returns, advantage) with each shape (bsz, ).
         """
@@ -306,11 +372,11 @@ class BasePolicy(ABC, nn.Module):
             assert np.isclose(gae_lambda, 1.0)
             v_s_ = np.zeros_like(rew)
         else:
-            v_s_ = to_numpy(v_s_.flatten())  # type: ignore
+            v_s_ = to_numpy(v_s_.flatten())
             v_s_ = v_s_ * BasePolicy.value_mask(buffer, indices)
         v_s = np.roll(v_s_, 1) if v_s is None else to_numpy(v_s.flatten())
 
-        end_flag = batch.done.copy()
+        end_flag = np.logical_or(batch.terminated, batch.truncated)
         end_flag[np.isin(indices, buffer.unfinished_index())] = True
         advantage = _gae_return(v_s, v_s_, rew, end_flag, gamma, gae_lambda)
         returns = advantage + v_s
@@ -348,15 +414,16 @@ class BasePolicy(ABC, nn.Module):
         :return: a Batch. The result will be stored in batch.returns as a
             torch.Tensor with the same shape as target_q_fn's return tensor.
         """
-        assert not rew_norm, \
-            "Reward normalization in computing n-step returns is unsupported now."
+        assert (
+            not rew_norm
+        ), "Reward normalization in computing n-step returns is unsupported now."
         rew = buffer.rew
         bsz = len(indice)
         indices = [indice]
         for _ in range(n_step - 1):
             indices.append(buffer.next(indices[-1]))
         indices = np.stack(indices)
-        # terminal indicates buffer indexes nstep after 'indice',
+        # terminal indicates buffer indexes nstep after 'indices',
         # and are truncated at the end of each episode
         terminal = indices[-1]
         with torch.no_grad():
@@ -372,7 +439,8 @@ class BasePolicy(ABC, nn.Module):
             batch.weight = to_torch_as(batch.weight, target_q_torch)
         return batch
 
-    def _compile(self) -> None:
+    @staticmethod
+    def _compile() -> None:
         f64 = np.array([0, 1], dtype=np.float64)
         f32 = np.array([0, 1], dtype=np.float32)
         b = np.array([False, True], dtype=np.bool_)
@@ -391,6 +459,34 @@ def _gae_return(
     gamma: float,
     gae_lambda: float,
 ) -> np.ndarray:
+    """
+    This doesn't compute returns but rather advantages. The return
+    is given by the output of this + v_s. Note that the advantages plus v_s
+    is exactly the same as the TD-lambda target, which is computed by the recursive
+    formula:
+
+    .. math::
+        G_t^\lambda = r_t + \gamma ( \lambda G_{t+1}^\lambda + (1 - \lambda) V_{t+1} )
+
+    The GAE is computed recursively as:
+
+    .. math::
+        \delta_t = r_t + \gamma V_{t+1} - V_t \n
+        A_t^\lambda= \delta_t + \gamma \lambda A_{t+1}^\lambda
+
+    And the following equality holds:
+
+    .. math::
+        G_t^\lambda = A_t^\lambda+ V_t
+
+    :param v_s: values in an episode, i.e. $V_t$
+    :param v_s_: next values in an episode, i.e. v_s shifted by 1, equivalent to $V_{t+1}$
+    :param rew: rewards in an episode, i.e. $r_t$
+    :param end_flag: boolean array indicating whether the episode is done
+    :param gamma: discount factor
+    :param gae_lambda: lambda parameter for GAE, controlling the bias-variance tradeoff
+    :return:
+    """
     returns = np.zeros(rew.shape)
     delta = rew + v_s_ * gamma - v_s
     discount = (1.0 - end_flag) * (gamma * gae_lambda)

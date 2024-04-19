@@ -1,16 +1,21 @@
 """Trainer package."""
 
-# isort:skip_file
-
-from tianshou.trainer.utils import test_episode, gather_info
-from tianshou.trainer.onpolicy import onpolicy_trainer
-from tianshou.trainer.offpolicy import offpolicy_trainer
-from tianshou.trainer.offline import offline_trainer
+from tianshou.trainer.base import (
+    BaseTrainer,
+    OffpolicyTrainer,
+    OnpolicyTrainer,
+    offpolicy_trainer,
+    offpolicy_trainer_iter,
+    onpolicy_trainer,
+    onpolicy_trainer_iter,
+)
+from tianshou.trainer.utils import gather_info, test_episode
 
 __all__ = [
-    "offpolicy_trainer",
-    "onpolicy_trainer",
+    "BaseTrainer",
     "offline_trainer",
+    "offline_trainer_iter",
+    "OfflineTrainer",
     "test_episode",
     "gather_info",
 ]

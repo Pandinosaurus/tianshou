@@ -1,6 +1,6 @@
 import warnings
 from copy import deepcopy
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -32,6 +32,8 @@ class DDPGPolicy(BasePolicy):
         Default to "clip".
     :param Optional[gym.Space] action_space: env's action space, mandatory if you want
         to use option "action_scaling" or "action_bound_method". Default to None.
+    :param lr_scheduler: a learning rate scheduler that adjusts the learning rate in
+        optimizer in each policy.update(). Default to None (no lr_scheduler).
 
     .. seealso::
 
@@ -51,17 +53,36 @@ class DDPGPolicy(BasePolicy):
         reward_normalization: bool = False,
         estimation_step: int = 1,
         action_scaling: bool = True,
-        action_bound_method: str = "clip",
+        action_bound_method: Optional[Literal["clip", "tanh"]] = "clip",
         **kwargs: Any,
     ) -> None:
         super().__init__(
             action_scaling=action_scaling,
             action_bound_method=action_bound_method,
-            **kwargs
+            **kwargs,
         )
-        assert action_bound_method != "tanh", "tanh mapping is not supported" \
-            "in policies where action is used as input of critic , because" \
+        assert action_bound_method != "tanh", (
+            "tanh mapping is not supported"
+            "in policies where action is used as input of critic , because"
             "raw action in range (-inf, inf) will cause instability in training"
+        )
+        try:
+            if (
+                actor is not None
+                and action_scaling
+                and not np.isclose(actor.max_action, 1.0)
+            ):  # type: ignore
+                import warnings
+
+                warnings.warn(
+                    "action_scaling and action_bound_method are only intended to deal"
+                    "with unbounded model action space, but find actor model bound"
+                    f"action space with max_action={actor.max_action}."
+                    "Consider using unbounded=True option of the actor model,"
+                    'or set action_scaling to False and action_bound_method to "".'
+                )
+        except Exception:
+            pass
         if actor is not None and actor_optim is not None:
             self.actor: torch.nn.Module = actor
             self.actor_old = deepcopy(actor)
@@ -101,8 +122,7 @@ class DDPGPolicy(BasePolicy):
     def _target_q(self, buffer: ReplayBuffer, indices: np.ndarray) -> torch.Tensor:
         batch = buffer[indices]  # batch.obs_next: s_{t+n}
         target_q = self.critic_old(
-            batch.obs_next,
-            self(batch, model='actor_old', input='obs_next').act
+            batch.obs_next, self(batch, model="actor_old", input="obs_next").act
         )
         return target_q
 
@@ -110,8 +130,13 @@ class DDPGPolicy(BasePolicy):
         self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
     ) -> Batch:
         batch = self.compute_nstep_return(
-            batch, buffer, indices, self._target_q, self._gamma, self._n_step,
-            self._rew_norm
+            batch,
+            buffer,
+            indices,
+            self._target_q,
+            self._gamma,
+            self._n_step,
+            self._rew_norm,
         )
         return batch
 
@@ -119,7 +144,7 @@ class DDPGPolicy(BasePolicy):
         self,
         batch: Batch,
         state: Optional[Union[dict, Batch, np.ndarray]] = None,
-        model: str = "actor",
+        model: Literal["actor", "actor_old"] = "actor",
         input: str = "obs",
         **kwargs: Any,
     ) -> Batch:
@@ -166,13 +191,11 @@ class DDPGPolicy(BasePolicy):
         actor_loss.backward()
         self.actor_optim.step()
         self.sync_weight()
-        return {
-            "loss/actor": actor_loss.item(),
-            "loss/critic": critic_loss.item(),
-        }
+        return {"loss/actor": actor_loss.item(), "loss/critic": critic_loss.item()}
 
-    def exploration_noise(self, act: Union[np.ndarray, Batch],
-                          batch: Batch) -> Union[np.ndarray, Batch]:
+    def exploration_noise(
+        self, act: Union[np.ndarray, Batch], batch: Batch
+    ) -> Union[np.ndarray, Batch]:
         if self._noise is None:
             return act
         if isinstance(act, np.ndarray):

@@ -28,7 +28,13 @@ class ReplayBuffer:
         when using frame-stack sampling method. Default to False.
     """
 
-    _reserved_keys = ("obs", "act", "rew", "done", "obs_next", "info", "policy")
+    _reserved_keys = (
+        "obs", "act", "rew", "terminated", "truncated", "done", "obs_next", "info",
+        "policy"
+    )
+    _input_keys = (
+        "obs", "act", "rew", "terminated", "truncated", "obs_next", "info", "policy"
+    )
 
     def __init__(
         self,
@@ -46,7 +52,7 @@ class ReplayBuffer:
             "sample_avail": sample_avail,
         }
         super().__init__()
-        self.maxsize = size
+        self.maxsize = int(size)
         assert stack_num > 0, "stack_num should be greater than 0"
         self.stack_num = stack_num
         self._indices = np.arange(size)
@@ -86,10 +92,10 @@ class ReplayBuffer:
                 ), "key '{}' is reserved and cannot be assigned".format(key)
         super().__setattr__(key, value)
 
-    def save_hdf5(self, path: str) -> None:
+    def save_hdf5(self, path: str, compression: Optional[str] = None) -> None:
         """Save replay buffer to HDF5 file."""
         with h5py.File(path, "w") as f:
-            to_hdf5(self.__dict__, f)
+            to_hdf5(self.__dict__, f, compression=compression)
 
     @classmethod
     def load_hdf5(cls, path: str, device: Optional[str] = None) -> "ReplayBuffer":
@@ -97,6 +103,32 @@ class ReplayBuffer:
         with h5py.File(path, "r") as f:
             buf = cls.__new__(cls)
             buf.__setstate__(from_hdf5(f, device=device))  # type: ignore
+        return buf
+
+    @classmethod
+    def from_data(
+        cls, obs: h5py.Dataset, act: h5py.Dataset, rew: h5py.Dataset,
+        terminated: h5py.Dataset, truncated: h5py.Dataset, done: h5py.Dataset,
+        obs_next: h5py.Dataset
+    ) -> "ReplayBuffer":
+        size = len(obs)
+        assert all(len(dset) == size for dset in [obs, act, rew, terminated,
+                                                  truncated, done, obs_next]), \
+            "Lengths of all hdf5 datasets need to be equal."
+        buf = cls(size)
+        if size == 0:
+            return buf
+        batch = Batch(
+            obs=obs,
+            act=act,
+            rew=rew,
+            terminated=terminated,
+            truncated=truncated,
+            done=done,
+            obs_next=obs_next
+        )
+        buf.set_batch(batch)
+        buf._size = size
         return buf
 
     def reset(self, keep_statistics: bool = False) -> None:
@@ -189,7 +221,8 @@ class ReplayBuffer:
         """Add a batch of data into replay buffer.
 
         :param Batch batch: the input data batch. Its keys must belong to the 7
-            reserved keys, and "obs", "act", "rew", "done" is required.
+            input keys, and "obs", "act", "rew", "terminated", "truncated" is
+            required.
         :param buffer_ids: to make consistent with other buffer's add function; if it
             is not None, we assume the input batch's first dimension is always 1.
 
@@ -199,10 +232,12 @@ class ReplayBuffer:
         """
         # preprocess batch
         new_batch = Batch()
-        for key in set(self._reserved_keys).intersection(batch.keys()):
+        for key in set(self._input_keys).intersection(batch.keys()):
             new_batch.__dict__[key] = batch[key]
         batch = new_batch
-        assert set(["obs", "act", "rew", "done"]).issubset(batch.keys())
+        batch.__dict__["done"] = np.logical_or(batch.terminated, batch.truncated)
+        assert set(["obs", "act", "rew", "terminated", "truncated",
+                    "done"]).issubset(batch.keys())
         stacked_batch = buffer_ids is not None
         if stacked_batch:
             assert len(batch) == 1
@@ -228,6 +263,8 @@ class ReplayBuffer:
             stack = not stacked_batch
             batch.rew = batch.rew.astype(float)
             batch.done = batch.done.astype(bool)
+            batch.terminated = batch.terminated.astype(bool)
+            batch.truncated = batch.truncated.astype(bool)
             if self._meta.is_empty():
                 self._meta = _create_value(  # type: ignore
                     batch, self.maxsize, stack)
@@ -331,7 +368,7 @@ class ReplayBuffer:
             indices = self.sample_indices(0) if index == slice(None) \
                 else self._indices[:len(self)][index]
         else:
-            indices = index
+            indices = index  # type: ignore
         # raise KeyError first instead of AttributeError,
         # to support np.array([ReplayBuffer()])
         obs = self.get(indices, "obs")
@@ -343,6 +380,8 @@ class ReplayBuffer:
             obs=obs,
             act=self.act[indices],
             rew=self.rew[indices],
+            terminated=self.terminated[indices],
+            truncated=self.truncated[indices],
             done=self.done[indices],
             obs_next=obs_next,
             info=self.get(indices, "info", Batch()),

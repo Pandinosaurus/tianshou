@@ -2,23 +2,29 @@ import argparse
 import os
 import pprint
 
-import gym
+import gymnasium as gym
 import numpy as np
+import pytest
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from tianshou.data import Collector, VectorReplayBuffer
-from tianshou.env import DummyVectorEnv
 from tianshou.policy import A2CPolicy, ImitationPolicy
 from tianshou.trainer import offpolicy_trainer, onpolicy_trainer
 from tianshou.utils import TensorboardLogger
 from tianshou.utils.net.common import ActorCritic, Net
 from tianshou.utils.net.discrete import Actor, Critic
 
+try:
+    import envpool
+except ImportError:
+    envpool = None
+
 
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, default='CartPole-v0')
+    parser.add_argument('--reward-threshold', type=float, default=None)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--buffer-size', type=int, default=20000)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -51,25 +57,25 @@ def get_args():
     return args
 
 
+@pytest.mark.skipif(envpool is None, reason="EnvPool doesn't support this platform")
 def test_a2c_with_il(args=get_args()):
-    torch.set_num_threads(1)  # for poor CPU
-    env = gym.make(args.task)
+    # if you want to use python vector env, please refer to other test scripts
+    train_envs = env = envpool.make(
+        args.task, env_type="gymnasium", num_envs=args.training_num, seed=args.seed
+    )
+    test_envs = envpool.make(
+        args.task, env_type="gymnasium", num_envs=args.test_num, seed=args.seed
+    )
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
-    # you can also use tianshou.env.SubprocVectorEnv
-    # train_envs = gym.make(args.task)
-    train_envs = DummyVectorEnv(
-        [lambda: gym.make(args.task) for _ in range(args.training_num)]
-    )
-    # test_envs = gym.make(args.task)
-    test_envs = DummyVectorEnv(
-        [lambda: gym.make(args.task) for _ in range(args.test_num)]
-    )
+    if args.reward_threshold is None:
+        default_reward_threshold = {"CartPole-v0": 195}
+        args.reward_threshold = default_reward_threshold.get(
+            args.task, env.spec.reward_threshold
+        )
     # seed
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    train_envs.seed(args.seed)
-    test_envs.seed(args.seed)
     # model
     net = Net(args.state_shape, hidden_sizes=args.hidden_sizes, device=args.device)
     actor = Actor(net, args.action_shape, device=args.device).to(args.device)
@@ -99,11 +105,11 @@ def test_a2c_with_il(args=get_args()):
     writer = SummaryWriter(log_path)
     logger = TensorboardLogger(writer)
 
-    def save_fn(policy):
+    def save_best_fn(policy):
         torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
 
     def stop_fn(mean_rewards):
-        return mean_rewards >= env.spec.reward_threshold
+        return mean_rewards >= args.reward_threshold
 
     # trainer
     result = onpolicy_trainer(
@@ -117,7 +123,7 @@ def test_a2c_with_il(args=get_args()):
         args.batch_size,
         episode_per_collect=args.episode_per_collect,
         stop_fn=stop_fn,
-        save_fn=save_fn,
+        save_best_fn=save_best_fn,
         logger=logger
     )
     assert stop_fn(result['best_reward'])
@@ -134,15 +140,17 @@ def test_a2c_with_il(args=get_args()):
 
     policy.eval()
     # here we define an imitation collector with a trivial policy
-    if args.task == 'CartPole-v0':
-        env.spec.reward_threshold = 190  # lower the goal
+    # if args.task == 'CartPole-v0':
+    #     env.spec.reward_threshold = 190  # lower the goal
     net = Net(args.state_shape, hidden_sizes=args.hidden_sizes, device=args.device)
     net = Actor(net, args.action_shape, device=args.device).to(args.device)
     optim = torch.optim.Adam(net.parameters(), lr=args.il_lr)
     il_policy = ImitationPolicy(net, optim, action_space=env.action_space)
     il_test_collector = Collector(
         il_policy,
-        DummyVectorEnv([lambda: gym.make(args.task) for _ in range(args.test_num)])
+        envpool.make(
+            args.task, env_type="gymnasium", num_envs=args.test_num, seed=args.seed
+        ),
     )
     train_collector.reset()
     result = offpolicy_trainer(
@@ -155,7 +163,7 @@ def test_a2c_with_il(args=get_args()):
         args.test_num,
         args.batch_size,
         stop_fn=stop_fn,
-        save_fn=save_fn,
+        save_best_fn=save_best_fn,
         logger=logger
     )
     assert stop_fn(result['best_reward'])

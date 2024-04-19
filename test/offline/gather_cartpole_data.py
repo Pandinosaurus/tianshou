@@ -2,7 +2,7 @@ import argparse
 import os
 import pickle
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -15,9 +15,14 @@ from tianshou.utils import TensorboardLogger
 from tianshou.utils.net.common import Net
 
 
+def expert_file_name():
+    return os.path.join(os.path.dirname(__file__), "expert_QRDQN_CartPole-v0.pkl")
+
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, default='CartPole-v0')
+    parser.add_argument('--reward-threshold', type=float, default=None)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--eps-test', type=float, default=0.05)
     parser.add_argument('--eps-train', type=float, default=0.1)
@@ -42,9 +47,7 @@ def get_args():
     parser.add_argument('--prioritized-replay', action="store_true", default=False)
     parser.add_argument('--alpha', type=float, default=0.6)
     parser.add_argument('--beta', type=float, default=0.4)
-    parser.add_argument(
-        '--save-buffer-name', type=str, default="./expert_QRDQN_CartPole-v0.pkl"
-    )
+    parser.add_argument('--save-buffer-name', type=str, default=expert_file_name())
     parser.add_argument(
         '--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu'
     )
@@ -55,10 +58,13 @@ def get_args():
 def gather_data():
     args = get_args()
     env = gym.make(args.task)
-    if args.task == 'CartPole-v0':
-        env.spec.reward_threshold = 190  # lower the goal
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
+    if args.reward_threshold is None:
+        default_reward_threshold = {"CartPole-v0": 190}
+        args.reward_threshold = default_reward_threshold.get(
+            args.task, env.spec.reward_threshold
+        )
     # train_envs = gym.make(args.task)
     # you can also use tianshou.env.SubprocVectorEnv
     train_envs = DummyVectorEnv(
@@ -111,11 +117,11 @@ def gather_data():
     writer = SummaryWriter(log_path)
     logger = TensorboardLogger(writer)
 
-    def save_fn(policy):
+    def save_best_fn(policy):
         torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
 
     def stop_fn(mean_rewards):
-        return mean_rewards >= env.spec.reward_threshold
+        return mean_rewards >= args.reward_threshold
 
     def train_fn(epoch, env_step):
         # eps annnealing, just a demo
@@ -144,7 +150,7 @@ def gather_data():
         train_fn=train_fn,
         test_fn=test_fn,
         stop_fn=stop_fn,
-        save_fn=save_fn,
+        save_best_fn=save_best_fn,
         logger=logger,
         update_per_step=args.update_per_step,
     )
@@ -155,6 +161,9 @@ def gather_data():
     policy.set_eps(0.2)
     collector = Collector(policy, test_envs, buf, exploration_noise=True)
     result = collector.collect(n_step=args.buffer_size)
-    pickle.dump(buf, open(args.save_buffer_name, "wb"))
+    if args.save_buffer_name.endswith(".hdf5"):
+        buf.save_hdf5(args.save_buffer_name)
+    else:
+        pickle.dump(buf, open(args.save_buffer_name, "wb"))
     print(result["rews"].mean())
     return buf

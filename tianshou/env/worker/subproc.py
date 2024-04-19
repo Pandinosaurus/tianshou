@@ -5,10 +5,10 @@ from multiprocessing import Array, Pipe, connection
 from multiprocessing.context import Process
 from typing import Any, Callable, List, Optional, Tuple, Union
 
-import gym
+import gymnasium as gym
 import numpy as np
 
-from tianshou.env.utils import CloudpickleWrapper
+from tianshou.env.utils import CloudpickleWrapper, gym_new_venv_step_type
 from tianshou.env.worker import EnvWorker
 
 _NP_TO_CT = {
@@ -37,12 +37,13 @@ class ShArray:
     def save(self, ndarray: np.ndarray) -> None:
         assert isinstance(ndarray, np.ndarray)
         dst = self.arr.get_obj()
-        dst_np = np.frombuffer(dst, dtype=self.dtype).reshape(self.shape)
+        dst_np = np.frombuffer(dst,
+                               dtype=self.dtype).reshape(self.shape)  # type: ignore
         np.copyto(dst_np, ndarray)
 
     def get(self) -> np.ndarray:
         obj = self.arr.get_obj()
-        return np.frombuffer(obj, dtype=self.dtype).reshape(self.shape)
+        return np.frombuffer(obj, dtype=self.dtype).reshape(self.shape)  # type: ignore
 
 
 def _setup_buf(space: gym.Space) -> Union[dict, tuple, ShArray]:
@@ -53,7 +54,7 @@ def _setup_buf(space: gym.Space) -> Union[dict, tuple, ShArray]:
         assert isinstance(space.spaces, tuple)
         return tuple([_setup_buf(t) for t in space.spaces])
     else:
-        return ShArray(space.dtype, space.shape)
+        return ShArray(space.dtype, space.shape)  # type: ignore
 
 
 def _worker(
@@ -86,17 +87,17 @@ def _worker(
                 p.close()
                 break
             if cmd == "step":
-                if data is None:  # reset
-                    obs = env.reset()
-                else:
-                    obs, reward, done, info = env.step(data)
+                env_return = env.step(data)
+                if obs_bufs is not None:
+                    _encode_obs(env_return[0], obs_bufs)
+                    env_return = (None, *env_return[1:])
+                p.send(env_return)
+            elif cmd == "reset":
+                obs, info = env.reset(**data)
                 if obs_bufs is not None:
                     _encode_obs(obs, obs_bufs)
                     obs = None
-                if data is None:
-                    p.send(obs)
-                else:
-                    p.send((obs, reward, done, info))
+                p.send((obs, info))
             elif cmd == "close":
                 p.send(env.close())
                 p.close()
@@ -104,11 +105,15 @@ def _worker(
             elif cmd == "render":
                 p.send(env.render(**data) if hasattr(env, "render") else None)
             elif cmd == "seed":
-                p.send(env.seed(data) if hasattr(env, "seed") else None)
+                if hasattr(env, "seed"):
+                    p.send(env.seed(data))
+                else:
+                    env.reset(seed=data)
+                    p.send(None)
             elif cmd == "getattr":
                 p.send(getattr(env, data) if hasattr(env, data) else None)
             elif cmd == "setattr":
-                setattr(env, data["key"], data["value"])
+                setattr(env.unwrapped, data["key"], data["value"])
             else:
                 p.close()
                 raise NotImplementedError
@@ -140,7 +145,6 @@ class SubprocEnvWorker(EnvWorker):
         self.process = Process(target=_worker, args=args, daemon=True)
         self.process.start()
         self.child_remote.close()
-        self.is_reset = False
         super().__init__(env_fn)
 
     def get_env_attr(self, key: str) -> Any:
@@ -186,18 +190,45 @@ class SubprocEnvWorker(EnvWorker):
             remain_conns = [conn for conn in remain_conns if conn not in ready_conns]
         return [workers[conns.index(con)] for con in ready_conns]
 
-    def send(self, action: Optional[np.ndarray]) -> None:
-        self.parent_remote.send(["step", action])
+    def send(self, action: Optional[np.ndarray], **kwargs: Any) -> None:
+        if action is None:
+            if "seed" in kwargs:
+                super().seed(kwargs["seed"])
+            self.parent_remote.send(["reset", kwargs])
+        else:
+            self.parent_remote.send(["step", action])
 
     def recv(
         self
-    ) -> Union[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
+    ) -> Union[gym_new_venv_step_type, Tuple[np.ndarray, dict]]:  # noqa:E125
         result = self.parent_remote.recv()
         if isinstance(result, tuple):
-            obs, rew, done, info = result
+            if len(result) == 2:
+                obs, info = result
+                if self.share_memory:
+                    obs = self._decode_obs()
+                return obs, info
+            obs = result[0]
             if self.share_memory:
                 obs = self._decode_obs()
-            return obs, rew, done, info
+            return (obs, *result[1:])  # type: ignore
+        else:
+            obs = result
+            if self.share_memory:
+                obs = self._decode_obs()
+            return obs
+
+    def reset(self, **kwargs: Any) -> Tuple[np.ndarray, dict]:
+        if "seed" in kwargs:
+            super().seed(kwargs["seed"])
+        self.parent_remote.send(["reset", kwargs])
+
+        result = self.parent_remote.recv()
+        if isinstance(result, tuple):
+            obs, info = result
+            if self.share_memory:
+                obs = self._decode_obs()
+            return obs, info
         else:
             obs = result
             if self.share_memory:

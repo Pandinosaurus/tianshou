@@ -2,7 +2,7 @@ import argparse
 import os
 import pickle
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -16,11 +16,16 @@ from tianshou.utils.net.common import Net
 from tianshou.utils.net.continuous import ActorProb, Critic
 
 
+def expert_file_name():
+    return os.path.join(os.path.dirname(__file__), "expert_SAC_Pendulum-v1.pkl")
+
+
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--task', type=str, default='Pendulum-v0')
+    parser.add_argument('--task', type=str, default='Pendulum-v1')
+    parser.add_argument('--reward-threshold', type=float, default=None)
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--buffer-size', type=int, default=200000)
+    parser.add_argument('--buffer-size', type=int, default=20000)
     parser.add_argument('--hidden-sizes', type=int, nargs='*', default=[128, 128])
     parser.add_argument('--actor-lr', type=float, default=1e-3)
     parser.add_argument('--critic-lr', type=float, default=1e-3)
@@ -52,9 +57,7 @@ def get_args():
     parser.add_argument('--alpha-lr', type=float, default=3e-4)
     parser.add_argument('--rew-norm', action="store_true", default=False)
     parser.add_argument('--n-step', type=int, default=3)
-    parser.add_argument(
-        "--save-buffer-name", type=str, default="./expert_SAC_Pendulum-v0.pkl"
-    )
+    parser.add_argument("--save-buffer-name", type=str, default=expert_file_name())
     args = parser.parse_known_args()[0]
     return args
 
@@ -63,11 +66,14 @@ def gather_data():
     """Return expert buffer data."""
     args = get_args()
     env = gym.make(args.task)
-    if args.task == 'Pendulum-v0':
-        env.spec.reward_threshold = -250
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
     args.max_action = env.action_space.high[0]
+    if args.reward_threshold is None:
+        default_reward_threshold = {"Pendulum-v0": -250, "Pendulum-v1": -250}
+        args.reward_threshold = default_reward_threshold.get(
+            args.task, env.spec.reward_threshold
+        )
     # you can also use tianshou.env.SubprocVectorEnv
     # train_envs = gym.make(args.task)
     train_envs = DummyVectorEnv(
@@ -87,7 +93,6 @@ def gather_data():
     actor = ActorProb(
         net,
         args.action_shape,
-        max_action=args.max_action,
         device=args.device,
         unbounded=True,
     ).to(args.device)
@@ -141,11 +146,11 @@ def gather_data():
     writer = SummaryWriter(log_path)
     logger = TensorboardLogger(writer)
 
-    def save_fn(policy):
+    def save_best_fn(policy):
         torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
 
     def stop_fn(mean_rewards):
-        return mean_rewards >= env.spec.reward_threshold
+        return mean_rewards >= args.reward_threshold
 
     # trainer
     offpolicy_trainer(
@@ -158,7 +163,7 @@ def gather_data():
         args.test_num,
         args.batch_size,
         update_per_step=args.update_per_step,
-        save_fn=save_fn,
+        save_best_fn=save_best_fn,
         stop_fn=stop_fn,
         logger=logger,
     )
@@ -166,5 +171,8 @@ def gather_data():
     result = train_collector.collect(n_step=args.buffer_size)
     rews, lens = result["rews"], result["lens"]
     print(f"Final reward: {rews.mean()}, length: {lens.mean()}")
-    pickle.dump(buffer, open(args.save_buffer_name, "wb"))
+    if args.save_buffer_name.endswith(".hdf5"):
+        buffer.save_hdf5(args.save_buffer_name)
+    else:
+        pickle.dump(buffer, open(args.save_buffer_name, "wb"))
     return buffer

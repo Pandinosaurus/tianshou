@@ -1,10 +1,9 @@
+import gymnasium as gym
+import numpy as np
 import time
+import torch
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Union
-
-import gym
-import numpy as np
-import torch
 
 from tianshou.data import (
     Batch,
@@ -19,7 +18,7 @@ from tianshou.env import BaseVectorEnv, DummyVectorEnv
 from tianshou.policy import BasePolicy
 
 
-class Collector(object):
+class Collector:
     """Collector enables the policy to interact with different types of envs with \
     exact number of steps or episodes.
 
@@ -37,10 +36,12 @@ class Collector(object):
 
     The "preprocess_fn" is a function called before the data has been added to the
     buffer with batch format. It will receive only "obs" and "env_id" when the
-    collector resets the environment, and will receive six keys "obs_next", "rew",
-    "done", "info", "policy" and "env_id" in a normal env step. It returns either a
-    dict or a :class:`~tianshou.data.Batch` with the modified keys and values. Examples
-    are in "test/base/test_collector.py".
+    collector resets the environment, and will receive the keys "obs_next", "rew",
+    "terminated", "truncated, "info", "policy" and "env_id" in a normal env step.
+    Alternatively, it may also accept the keys "obs_next", "rew", "done", "info",
+    "policy" and "env_id".
+    It returns either a dict or a :class:`~tianshou.data.Batch` with the modified
+    keys and values. Examples are in "test/base/test_collector.py".
 
     .. note::
 
@@ -48,6 +49,7 @@ class Collector(object):
         collect option.
 
     .. note::
+
         In past versions of Tianshou, the replay buffer that was passed to `__init__`
         was automatically reset. This is not done in the current implementation.
     """
@@ -63,14 +65,15 @@ class Collector(object):
         super().__init__()
         if isinstance(env, gym.Env) and not hasattr(env, "__len__"):
             warnings.warn("Single environment detected, wrap to DummyVectorEnv.")
-            env = DummyVectorEnv([lambda: env])
-        self.env = env
-        self.env_num = len(env)
+            self.env = DummyVectorEnv([lambda: env])  # type: ignore
+        else:
+            self.env = env  # type: ignore
+        self.env_num = len(self.env)
         self.exploration_noise = exploration_noise
         self._assign_buffer(buffer)
         self.policy = policy
         self.preprocess_fn = preprocess_fn
-        self._action_space = env.action_space
+        self._action_space = self.env.action_space
         # avoid creating attribute outside __init__
         self.reset(False)
 
@@ -98,18 +101,32 @@ class Collector(object):
                 )
         self.buffer = buffer
 
-    def reset(self, reset_buffer: bool = True) -> None:
+    def reset(
+        self,
+        reset_buffer: bool = True,
+        gym_reset_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Reset the environment, statistics, current data and possibly replay memory.
 
         :param bool reset_buffer: if true, reset the replay buffer that is attached
             to the collector.
+        :param gym_reset_kwargs: extra keyword arguments to pass into the environment's
+            reset function. Defaults to None (extra keyword arguments)
         """
         # use empty Batch for "state" so that self.data supports slicing
         # convert empty Batch to None when passing data to policy
         self.data = Batch(
-            obs={}, act={}, rew={}, done={}, obs_next={}, info={}, policy={}
+            obs={},
+            act={},
+            rew={},
+            terminated={},
+            truncated={},
+            done={},
+            obs_next={},
+            info={},
+            policy={},
         )
-        self.reset_env()
+        self.reset_env(gym_reset_kwargs)
         if reset_buffer:
             self.reset_buffer()
         self.reset_stat()
@@ -122,12 +139,17 @@ class Collector(object):
         """Reset the data buffer."""
         self.buffer.reset(keep_statistics=keep_statistics)
 
-    def reset_env(self) -> None:
+    def reset_env(self, gym_reset_kwargs: Optional[Dict[str, Any]] = None) -> None:
         """Reset all of the environments."""
-        obs = self.env.reset()
+        gym_reset_kwargs = gym_reset_kwargs if gym_reset_kwargs else {}
+        obs, info = self.env.reset(**gym_reset_kwargs)
         if self.preprocess_fn:
-            obs = self.preprocess_fn(obs=obs,
-                                     env_id=np.arange(self.env_num)).get("obs", obs)
+            processed_data = self.preprocess_fn(
+                obs=obs, info=info, env_id=np.arange(self.env_num)
+            )
+            obs = processed_data.get("obs", obs)
+            info = processed_data.get("info", info)
+        self.data.info = info
         self.data.obs = obs
 
     def _reset_state(self, id: Union[int, List[int]]) -> None:
@@ -141,6 +163,24 @@ class Collector(object):
             elif isinstance(state, Batch):
                 state.empty_(id)
 
+    def _reset_env_with_ids(
+        self,
+        local_ids: Union[List[int], np.ndarray],
+        global_ids: Union[List[int], np.ndarray],
+        gym_reset_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        gym_reset_kwargs = gym_reset_kwargs if gym_reset_kwargs else {}
+        obs_reset, info = self.env.reset(global_ids, **gym_reset_kwargs)
+        if self.preprocess_fn:
+            processed_data = self.preprocess_fn(
+                obs=obs_reset, info=info, env_id=global_ids
+            )
+            obs_reset = processed_data.get("obs", obs_reset)
+            info = processed_data.get("info", info)
+        self.data.info[local_ids] = info
+
+        self.data.obs_next[local_ids] = obs_reset
+
     def collect(
         self,
         n_step: Optional[int] = None,
@@ -148,6 +188,7 @@ class Collector(object):
         random: bool = False,
         render: Optional[float] = None,
         no_grad: bool = True,
+        gym_reset_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Collect a specified number of step or episode.
 
@@ -163,6 +204,8 @@ class Collector(object):
             Default to None (no rendering).
         :param bool no_grad: whether to retain gradient in policy.forward(). Default to
             True (no gradient retaining).
+        :param gym_reset_kwargs: extra keyword arguments to pass into the environment's
+            reset function. Defaults to None (extra keyword arguments)
 
         .. note::
 
@@ -197,7 +240,7 @@ class Collector(object):
         elif n_episode is not None:
             assert n_episode > 0
             ready_env_ids = np.arange(min(self.env_num, n_episode))
-            self.data = self.data[:min(self.env_num, n_episode)]
+            self.data = self.data[: min(self.env_num, n_episode)]
         else:
             raise TypeError(
                 "Please specify at least one (either n_step or n_episode) "
@@ -219,9 +262,12 @@ class Collector(object):
 
             # get the next action
             if random:
-                self.data.update(
-                    act=[self._action_space[i].sample() for i in ready_env_ids]
-                )
+                try:
+                    act_sample = [self._action_space[i].sample() for i in ready_env_ids]
+                except TypeError:  # envpool's action space is not for per-env
+                    act_sample = [self._action_space.sample() for _ in ready_env_ids]
+                act_sample = self.policy.map_action_inverse(act_sample)  # type: ignore
+                self.data.update(act=act_sample)
             else:
                 if no_grad:
                     with torch.no_grad():  # faster than retain_grad version
@@ -243,10 +289,19 @@ class Collector(object):
             # get bounded and remapped actions first (not saved into buffer)
             action_remap = self.policy.map_action(self.data.act)
             # step in env
-            result = self.env.step(action_remap, ready_env_ids)  # type: ignore
-            obs_next, rew, done, info = result
+            obs_next, rew, terminated, truncated, info = self.env.step(
+                action_remap, ready_env_ids  # type: ignore
+            )
+            done = np.logical_or(terminated, truncated)
 
-            self.data.update(obs_next=obs_next, rew=rew, done=done, info=info)
+            self.data.update(
+                obs_next=obs_next,
+                rew=rew,
+                terminated=terminated,
+                truncated=truncated,
+                done=done,
+                info=info,
+            )
             if self.preprocess_fn:
                 self.data.update(
                     self.preprocess_fn(
@@ -256,6 +311,7 @@ class Collector(object):
                         info=self.data.info,
                         policy=self.data.policy,
                         env_id=ready_env_ids,
+                        act=self.data.act,
                     )
                 )
 
@@ -281,12 +337,9 @@ class Collector(object):
                 episode_start_indices.append(ep_idx[env_ind_local])
                 # now we copy obs_next to obs, but since there might be
                 # finished episodes, we have to reset finished envs first.
-                obs_reset = self.env.reset(env_ind_global)
-                if self.preprocess_fn:
-                    obs_reset = self.preprocess_fn(
-                        obs=obs_reset, env_id=env_ind_global
-                    ).get("obs", obs_reset)
-                self.data.obs_next[env_ind_local] = obs_reset
+                self._reset_env_with_ids(
+                    env_ind_local, env_ind_global, gym_reset_kwargs
+                )
                 for i in env_ind_local:
                     self._reset_state(i)
 
@@ -302,8 +355,9 @@ class Collector(object):
 
             self.data.obs = self.data.obs_next
 
-            if (n_step and step_count >= n_step) or \
-                    (n_episode and episode_count >= n_episode):
+            if (n_step and step_count >= n_step) or (
+                n_episode and episode_count >= n_episode
+            ):
                 break
 
         # generate statistics
@@ -313,16 +367,21 @@ class Collector(object):
 
         if n_episode:
             self.data = Batch(
-                obs={}, act={}, rew={}, done={}, obs_next={}, info={}, policy={}
+                obs={},
+                act={},
+                rew={},
+                terminated={},
+                truncated={},
+                done={},
+                obs_next={},
+                info={},
+                policy={},
             )
             self.reset_env()
 
         if episode_count > 0:
             rews, lens, idxs = list(
-                map(
-                    np.concatenate,
-                    [episode_rews, episode_lens, episode_start_indices]
-                )
+                map(np.concatenate, [episode_rews, episode_lens, episode_start_indices])
             )
             rew_mean, rew_std = rews.mean(), rews.std()
             len_mean, len_std = lens.mean(), lens.std()
@@ -359,10 +418,17 @@ class AsyncCollector(Collector):
         exploration_noise: bool = False,
     ) -> None:
         # assert env.is_async
-        super().__init__(policy, env, buffer, preprocess_fn, exploration_noise)
+        warnings.warn("Using async setting may collect extra transitions into buffer.")
+        super().__init__(
+            policy,
+            env,
+            buffer,
+            preprocess_fn,
+            exploration_noise,
+        )
 
-    def reset_env(self) -> None:
-        super().reset_env()
+    def reset_env(self, gym_reset_kwargs: Optional[Dict[str, Any]] = None) -> None:
+        super().reset_env(gym_reset_kwargs)
         self._ready_env_ids = np.arange(self.env_num)
 
     def collect(
@@ -372,6 +438,7 @@ class AsyncCollector(Collector):
         random: bool = False,
         render: Optional[float] = None,
         no_grad: bool = True,
+        gym_reset_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Collect a specified number of step or episode with async env setting.
 
@@ -387,6 +454,8 @@ class AsyncCollector(Collector):
             Default to None (no rendering).
         :param bool no_grad: whether to retain gradient in policy.forward(). Default to
             True (no gradient retaining).
+        :param gym_reset_kwargs: extra keyword arguments to pass into the environment's
+            reset function. Defaults to None (extra keyword arguments)
 
         .. note::
 
@@ -419,7 +488,6 @@ class AsyncCollector(Collector):
                 "Please specify at least one (either n_step or n_episode) "
                 "in AsyncCollector.collect()."
             )
-        warnings.warn("Using async setting may collect extra transitions into buffer.")
 
         ready_env_ids = self._ready_env_ids
 
@@ -440,9 +508,12 @@ class AsyncCollector(Collector):
 
             # get the next action
             if random:
-                self.data.update(
-                    act=[self._action_space[i].sample() for i in ready_env_ids]
-                )
+                try:
+                    act_sample = [self._action_space[i].sample() for i in ready_env_ids]
+                except TypeError:  # envpool's action space is not for per-env
+                    act_sample = [self._action_space.sample() for _ in ready_env_ids]
+                act_sample = self.policy.map_action_inverse(act_sample)  # type: ignore
+                self.data.update(act=act_sample)
             else:
                 if no_grad:
                     with torch.no_grad():  # faster than retain_grad version
@@ -472,8 +543,10 @@ class AsyncCollector(Collector):
             # get bounded and remapped actions first (not saved into buffer)
             action_remap = self.policy.map_action(self.data.act)
             # step in env
-            result = self.env.step(action_remap, ready_env_ids)  # type: ignore
-            obs_next, rew, done, info = result
+            obs_next, rew, terminated, truncated, info = self.env.step(
+                action_remap, ready_env_ids  # type: ignore
+            )
+            done = np.logical_or(terminated, truncated)
 
             # change self.data here because ready_env_ids has changed
             try:
@@ -482,17 +555,37 @@ class AsyncCollector(Collector):
                 ready_env_ids = np.array([i["env_id"] for i in info])
             self.data = whole_data[ready_env_ids]
 
-            self.data.update(obs_next=obs_next, rew=rew, done=done, info=info)
+            self.data.update(
+                obs_next=obs_next,
+                rew=rew,
+                terminated=terminated,
+                truncated=truncated,
+                info=info,
+            )
             if self.preprocess_fn:
-                self.data.update(
-                    self.preprocess_fn(
-                        obs_next=self.data.obs_next,
-                        rew=self.data.rew,
-                        done=self.data.done,
-                        info=self.data.info,
-                        env_id=ready_env_ids,
+                try:
+                    self.data.update(
+                        self.preprocess_fn(
+                            obs_next=self.data.obs_next,
+                            rew=self.data.rew,
+                            terminated=self.data.terminated,
+                            truncated=self.data.truncated,
+                            info=self.data.info,
+                            env_id=ready_env_ids,
+                            act=self.data.act,
+                        )
                     )
-                )
+                except TypeError:
+                    self.data.update(
+                        self.preprocess_fn(
+                            obs_next=self.data.obs_next,
+                            rew=self.data.rew,
+                            done=self.data.done,
+                            info=self.data.info,
+                            env_id=ready_env_ids,
+                            act=self.data.act,
+                        )
+                    )
 
             if render:
                 self.env.render()
@@ -516,12 +609,9 @@ class AsyncCollector(Collector):
                 episode_start_indices.append(ep_idx[env_ind_local])
                 # now we copy obs_next to obs, but since there might be
                 # finished episodes, we have to reset finished envs first.
-                obs_reset = self.env.reset(env_ind_global)
-                if self.preprocess_fn:
-                    obs_reset = self.preprocess_fn(
-                        obs=obs_reset, env_id=env_ind_global
-                    ).get("obs", obs_reset)
-                self.data.obs_next[env_ind_local] = obs_reset
+                self._reset_env_with_ids(
+                    env_ind_local, env_ind_global, gym_reset_kwargs
+                )
                 for i in env_ind_local:
                     self._reset_state(i)
 
@@ -536,8 +626,9 @@ class AsyncCollector(Collector):
                 whole_data[ready_env_ids] = self.data  # lots of overhead
             self.data = whole_data
 
-            if (n_step and step_count >= n_step) or \
-                    (n_episode and episode_count >= n_episode):
+            if (n_step and step_count >= n_step) or (
+                n_episode and episode_count >= n_episode
+            ):
                 break
 
         self._ready_env_ids = ready_env_ids
@@ -549,10 +640,7 @@ class AsyncCollector(Collector):
 
         if episode_count > 0:
             rews, lens, idxs = list(
-                map(
-                    np.concatenate,
-                    [episode_rews, episode_lens, episode_start_indices]
-                )
+                map(np.concatenate, [episode_rews, episode_lens, episode_start_indices])
             )
             rew_mean, rew_std = rews.mean(), rews.std()
             len_mean, len_std = lens.mean(), lens.std()

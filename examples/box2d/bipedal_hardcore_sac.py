@@ -2,7 +2,7 @@ import argparse
 import os
 import pprint
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -94,13 +94,8 @@ def test_sac_bipedal(args=get_args()):
 
     # model
     net_a = Net(args.state_shape, hidden_sizes=args.hidden_sizes, device=args.device)
-    actor = ActorProb(
-        net_a,
-        args.action_shape,
-        max_action=args.max_action,
-        device=args.device,
-        unbounded=True
-    ).to(args.device)
+    actor = ActorProb(net_a, args.action_shape, device=args.device,
+                      unbounded=True).to(args.device)
     actor_optim = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
 
     net_c1 = Net(
@@ -161,7 +156,7 @@ def test_sac_bipedal(args=get_args()):
     writer = SummaryWriter(log_path)
     logger = TensorboardLogger(writer)
 
-    def save_fn(policy):
+    def save_best_fn(policy):
         torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
 
     def stop_fn(mean_rewards):
@@ -180,7 +175,7 @@ def test_sac_bipedal(args=get_args()):
         update_per_step=args.update_per_step,
         test_in_train=False,
         stop_fn=stop_fn,
-        save_fn=save_fn,
+        save_best_fn=save_best_fn,
         logger=logger
     )
 

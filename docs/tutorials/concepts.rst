@@ -55,18 +55,22 @@ Buffer
 
 :class:`~tianshou.data.ReplayBuffer` stores data generated from interaction between the policy and environment. ReplayBuffer can be considered as a specialized form (or management) of :class:`~tianshou.data.Batch`. It stores all the data in a batch with circular-queue style.
 
-The current implementation of Tianshou typically use 7 reserved keys in
+The current implementation of Tianshou typically use the following reserved keys in
 :class:`~tianshou.data.Batch`:
 
 * ``obs`` the observation of step :math:`t` ;
 * ``act`` the action of step :math:`t` ;
 * ``rew`` the reward of step :math:`t` ;
-* ``done`` the done flag of step :math:`t` ;
+* ``terminated`` the terminated flag of step :math:`t` ;
+* ``truncated`` the truncated flag of step :math:`t` ;
+* ``done`` the done flag of step :math:`t` (can be inferred as ``terminated or truncated``);
 * ``obs_next`` the observation of step :math:`t+1` ;
 * ``info`` the info of step :math:`t` (in ``gym.Env``, the ``env.step()`` function returns 4 arguments, and the last one is ``info``);
 * ``policy`` the data computed by policy in step :math:`t`;
 
-The following code snippet illustrates its usage, including:
+When adding data to a replay buffer, the done flag will be inferred automatically from ``terminated``and ``truncated``.
+
+The following code snippet illustrates the usage, including:
 
 - the basic data storage: ``add()``;
 - get attribute, get slicing data, ...;
@@ -80,7 +84,7 @@ The following code snippet illustrates its usage, including:
     >>> from tianshou.data import Batch, ReplayBuffer
     >>> buf = ReplayBuffer(size=20)
     >>> for i in range(3):
-    ...     buf.add(Batch(obs=i, act=i, rew=i, done=0, obs_next=i + 1, info={}))
+    ...     buf.add(Batch(obs=i, act=i, rew=i, terminated=0, truncated=0, obs_next=i + 1, info={}))
 
     >>> buf.obs
     # since we set size = 20, len(buf.obs) == 20.
@@ -95,8 +99,8 @@ The following code snippet illustrates its usage, including:
 
     >>> buf2 = ReplayBuffer(size=10)
     >>> for i in range(15):
-    ...     done = i % 4 == 0
-    ...     buf2.add(Batch(obs=i, act=i, rew=i, done=done, obs_next=i + 1, info={}))
+    ...     terminated = i % 4 == 0
+    ...     buf2.add(Batch(obs=i, act=i, rew=i, terminated=terminated, truncated=False, obs_next=i + 1, info={}))
     >>> len(buf2)
     10
     >>> buf2.obs
@@ -146,10 +150,10 @@ The following code snippet illustrates its usage, including:
 
     >>> buf = ReplayBuffer(size=9, stack_num=4, ignore_obs_next=True)
     >>> for i in range(16):
-    ...     done = i % 5 == 0
+    ...     terminated = i % 5 == 0
     ...     ptr, ep_rew, ep_len, ep_idx = buf.add(
     ...         Batch(obs={'id': i}, act=i, rew=i,
-    ...               done=done, obs_next={'id': i + 1}))
+    ...               terminated=terminated, truncated=False, obs_next={'id': i + 1}))
     ...     print(i, ep_len, ep_rew)
     0 [1] [0.]
     1 [0] [0.]
@@ -379,6 +383,26 @@ Trainer
 Once you have a collector and a policy, you can start writing the training method for your RL agent. Trainer, to be honest, is a simple wrapper. It helps you save energy for writing the training loop. You can also construct your own trainer: :ref:`customized_trainer`.
 
 Tianshou has three types of trainer: :func:`~tianshou.trainer.onpolicy_trainer` for on-policy algorithms such as Policy Gradient, :func:`~tianshou.trainer.offpolicy_trainer` for off-policy algorithms such as DQN, and :func:`~tianshou.trainer.offline_trainer` for offline algorithms such as BCQ. Please check out :doc:`/api/tianshou.trainer` for the usage.
+
+We also provide the corresponding iterator-based trainer classes :class:`~tianshou.trainer.OnpolicyTrainer`, :class:`~tianshou.trainer.OffpolicyTrainer`, :class:`~tianshou.trainer.OfflineTrainer` to facilitate users writing more flexible training logic:
+::
+
+    trainer = OnpolicyTrainer(...)
+    for epoch, epoch_stat, info in trainer:
+        print(f"Epoch: {epoch}")
+        print(epoch_stat)
+        print(info)
+        do_something_with_policy()
+        query_something_about_policy()
+        make_a_plot_with(epoch_stat)
+        display(info)
+
+    # or even iterate on several trainers at the same time
+
+    trainer1 = OnpolicyTrainer(...)
+    trainer2 = OnpolicyTrainer(...)
+    for result1, result2, ... in zip(trainer1, trainer2, ...):
+        compare_results(result1, result2, ...)
 
 
 .. _pseudocode:

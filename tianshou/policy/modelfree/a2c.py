@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -7,6 +7,7 @@ from torch import nn
 
 from tianshou.data import Batch, ReplayBuffer, to_torch_as
 from tianshou.policy import PGPolicy
+from tianshou.policy.modelfree.pg import TDistParams
 from tianshou.utils.net.common import ActorCritic
 
 
@@ -18,7 +19,6 @@ class A2CPolicy(PGPolicy):
     :param torch.nn.Module critic: the critic network. (s -> V(s))
     :param torch.optim.Optimizer optim: the optimizer for actor and critic network.
     :param dist_fn: distribution class for computing the action.
-    :type dist_fn: Type[torch.distributions.Distribution]
     :param float discount_factor: in [0, 1]. Default to 0.99.
     :param float vf_coef: weight for value loss. Default to 0.5.
     :param float ent_coef: weight for entropy loss. Default to 0.01.
@@ -55,13 +55,13 @@ class A2CPolicy(PGPolicy):
         actor: torch.nn.Module,
         critic: torch.nn.Module,
         optim: torch.optim.Optimizer,
-        dist_fn: Type[torch.distributions.Distribution],
+        dist_fn: Callable[[TDistParams], torch.distributions.Distribution],
         vf_coef: float = 0.5,
         ent_coef: float = 0.01,
         max_grad_norm: Optional[float] = None,
         gae_lambda: float = 0.95,
         max_batchsize: int = 256,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         super().__init__(actor, optim, dist_fn, **kwargs)
         self.critic = critic
@@ -92,7 +92,7 @@ class A2CPolicy(PGPolicy):
         v_s = batch.v_s.cpu().numpy()
         v_s_ = torch.cat(v_s_, dim=0).flatten().cpu().numpy()
         # when normalizing values, we do not minus self.ret_rms.mean to be numerically
-        # consistent with OPENAI baselines' value normalization pipeline. Emperical
+        # consistent with OPENAI baselines' value normalization pipeline. Empirical
         # study also shows that "minus mean" will harm performances a tiny little bit
         # due to unknown reasons (on Mujoco envs, not confident, though).
         if self._rew_norm:  # unnormalize v_s & v_s_
@@ -105,11 +105,10 @@ class A2CPolicy(PGPolicy):
             v_s_,
             v_s,
             gamma=self._gamma,
-            gae_lambda=self._lambda
+            gae_lambda=self._lambda,
         )
         if self._rew_norm:
-            batch.returns = unnormalized_returns / \
-                np.sqrt(self.ret_rms.var + self._eps)
+            batch.returns = unnormalized_returns / np.sqrt(self.ret_rms.var + self._eps)
             self.ret_rms.update(unnormalized_returns)
         else:
             batch.returns = unnormalized_returns
@@ -133,8 +132,9 @@ class A2CPolicy(PGPolicy):
                 vf_loss = F.mse_loss(minibatch.returns, value)
                 # calculate regularization and overall loss
                 ent_loss = dist.entropy().mean()
-                loss = actor_loss + self._weight_vf * vf_loss \
-                    - self._weight_ent * ent_loss
+                loss = (
+                    actor_loss + self._weight_vf * vf_loss - self._weight_ent * ent_loss
+                )
                 self.optim.zero_grad()
                 loss.backward()
                 if self._grad_norm:  # clip large gradient
@@ -146,9 +146,6 @@ class A2CPolicy(PGPolicy):
                 vf_losses.append(vf_loss.item())
                 ent_losses.append(ent_loss.item())
                 losses.append(loss.item())
-        # update learning rate if lr_scheduler is given
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
 
         return {
             "loss": losses,

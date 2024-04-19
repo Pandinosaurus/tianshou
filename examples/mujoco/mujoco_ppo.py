@@ -1,219 +1,184 @@
 #!/usr/bin/env python3
 
-import argparse
-import datetime
 import os
 import pprint
-
-import gym
-import numpy as np
 import torch
+from jsonargparse import CLI
 from torch import nn
-from torch.distributions import Independent, Normal
-from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.tensorboard import SummaryWriter
 
-from tianshou.data import Collector, ReplayBuffer, VectorReplayBuffer
-from tianshou.env import SubprocVectorEnv
+from tianshou.config import (
+    BasicExperimentConfig,
+    LoggerConfig,
+    NNConfig,
+    PGConfig,
+    PPOConfig,
+    RLAgentConfig,
+    TrainerConfig,
+)
+from tianshou.config.utils import collect_configs
 from tianshou.policy import PPOPolicy
-from tianshou.trainer import onpolicy_trainer
-from tianshou.utils import TensorboardLogger
-from tianshou.utils.net.common import Net
-from tianshou.utils.net.continuous import ActorProb, Critic
+from tianshou.trainer import OnpolicyTrainer
+from tianshou.utils import set_seed
+from tianshou.utils.env import (
+    get_continuous_env_info,
+    get_train_test_collector,
+    make_mujoco_env,
+    watch_agent,
+)
+from tianshou.utils.logger import get_logger_for_run
+from tianshou.utils.lr_scheduler import get_linear_lr_schedular
+from tianshou.utils.models import (
+    fixed_std_normal,
+    get_actor_critic,
+    init_and_get_optim,
+    resume_from_checkpoint,
+)
 
 
-def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--task', type=str, default='HalfCheetah-v3')
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--buffer-size', type=int, default=4096)
-    parser.add_argument('--hidden-sizes', type=int, nargs='*', default=[64, 64])
-    parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--epoch', type=int, default=100)
-    parser.add_argument('--step-per-epoch', type=int, default=30000)
-    parser.add_argument('--step-per-collect', type=int, default=2048)
-    parser.add_argument('--repeat-per-collect', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--training-num', type=int, default=64)
-    parser.add_argument('--test-num', type=int, default=10)
-    # ppo special
-    parser.add_argument('--rew-norm', type=int, default=True)
-    # In theory, `vf-coef` will not make any difference if using Adam optimizer.
-    parser.add_argument('--vf-coef', type=float, default=0.25)
-    parser.add_argument('--ent-coef', type=float, default=0.0)
-    parser.add_argument('--gae-lambda', type=float, default=0.95)
-    parser.add_argument('--bound-action-method', type=str, default="clip")
-    parser.add_argument('--lr-decay', type=int, default=True)
-    parser.add_argument('--max-grad-norm', type=float, default=0.5)
-    parser.add_argument('--eps-clip', type=float, default=0.2)
-    parser.add_argument('--dual-clip', type=float, default=None)
-    parser.add_argument('--value-clip', type=int, default=0)
-    parser.add_argument('--norm-adv', type=int, default=0)
-    parser.add_argument('--recompute-adv', type=int, default=1)
-    parser.add_argument('--logdir', type=str, default='log')
-    parser.add_argument('--render', type=float, default=0.)
-    parser.add_argument(
-        '--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu'
-    )
-    parser.add_argument('--resume-path', type=str, default=None)
-    parser.add_argument(
-        '--watch',
-        default=False,
-        action='store_true',
-        help='watch the play of pre-trained policy only'
-    )
-    return parser.parse_args()
+def main(
+    experiment_config: BasicExperimentConfig,
+    logger_config: LoggerConfig,
+    sampling_config: TrainerConfig,
+    general_config: RLAgentConfig,
+    pg_config: PGConfig,
+    ppo_config: PPOConfig,
+    nn_config: NNConfig,
+):
+    """
+    Run the PPO test on the provided parameters.
 
+    :param experiment_config: BasicExperimentConfig - not ML or RL specific
+    :param logger_config: LoggerConfig
+    :param sampling_config: SamplingConfig -
+        sampling, epochs, parallelization, buffers, collectors, and batching.
+    :param general_config: RLAgentConfig - general RL agent config
+    :param pg_config: PGConfig: common to most policy gradient algorithms
+    :param ppo_config: PPOConfig - PPO specific config
+    :param nn_config: NNConfig - NN-training specific config
 
-def test_ppo(args=get_args()):
-    env = gym.make(args.task)
-    args.state_shape = env.observation_space.shape or env.observation_space.n
-    args.action_shape = env.action_space.shape or env.action_space.n
-    args.max_action = env.action_space.high[0]
-    print("Observations shape:", args.state_shape)
-    print("Actions shape:", args.action_shape)
-    print("Action range:", np.min(env.action_space.low), np.max(env.action_space.high))
-    # train_envs = gym.make(args.task)
-    train_envs = SubprocVectorEnv(
-        [lambda: gym.make(args.task) for _ in range(args.training_num)], norm_obs=True
-    )
-    # test_envs = gym.make(args.task)
-    test_envs = SubprocVectorEnv(
-        [lambda: gym.make(args.task) for _ in range(args.test_num)],
-        norm_obs=True,
-        obs_rms=train_envs.obs_rms,
-        update_obs_rms=False
+    :return: None
+    """
+    full_config = collect_configs(*locals().values())
+    set_seed(experiment_config.seed)
+
+    # create test and train envs, add env info to config
+    env, train_envs, test_envs = make_mujoco_env(
+        task=experiment_config.task,
+        seed=experiment_config.seed,
+        num_train_envs=sampling_config.num_train_envs,
+        num_test_envs=sampling_config.num_test_envs,
+        obs_norm=True,
+        render_mode=experiment_config.render_mode,
     )
 
-    # seed
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    train_envs.seed(args.seed)
-    test_envs.seed(args.seed)
-    # model
-    net_a = Net(
-        args.state_shape,
-        hidden_sizes=args.hidden_sizes,
-        activation=nn.Tanh,
-        device=args.device
+    # adding env_info to logged config
+    state_shape, action_shape, max_action = get_continuous_env_info(env)
+    full_config["env_info"] = {
+        "state_shape": state_shape,
+        "action_shape": action_shape,
+        "max_action": max_action,
+    }
+    log_path, logger = get_logger_for_run(
+        "ppo",
+        experiment_config.task,
+        logger_config,
+        full_config,
+        experiment_config.seed,
+        experiment_config.resume_id,
     )
-    actor = ActorProb(
-        net_a,
-        args.action_shape,
-        max_action=args.max_action,
-        unbounded=True,
-        device=args.device
-    ).to(args.device)
-    net_c = Net(
-        args.state_shape,
-        hidden_sizes=args.hidden_sizes,
-        activation=nn.Tanh,
-        device=args.device
-    )
-    critic = Critic(net_c, device=args.device).to(args.device)
-    torch.nn.init.constant_(actor.sigma_param, -0.5)
-    for m in list(actor.modules()) + list(critic.modules()):
-        if isinstance(m, torch.nn.Linear):
-            # orthogonal initialization
-            torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-            torch.nn.init.zeros_(m.bias)
-    # do last policy layer scaling, this will make initial actions have (close to)
-    # 0 mean and std, and will help boost performances,
-    # see https://arxiv.org/abs/2006.05990, Fig.24 for details
-    for m in actor.mu.modules():
-        if isinstance(m, torch.nn.Linear):
-            torch.nn.init.zeros_(m.bias)
-            m.weight.data.copy_(0.01 * m.weight.data)
 
-    optim = torch.optim.Adam(
-        list(actor.parameters()) + list(critic.parameters()), lr=args.lr
+    # Setup NNs
+    actor, critic = get_actor_critic(
+        state_shape, nn_config.hidden_sizes, action_shape, experiment_config.device
     )
+    optim = init_and_get_optim(actor, critic, nn_config.lr)
 
     lr_scheduler = None
-    if args.lr_decay:
-        # decay learning rate to 0 linearly
-        max_update_num = np.ceil(
-            args.step_per_epoch / args.step_per_collect
-        ) * args.epoch
-
-        lr_scheduler = LambdaLR(
-            optim, lr_lambda=lambda epoch: 1 - epoch / max_update_num
+    if nn_config.lr_decay:
+        lr_scheduler = get_linear_lr_schedular(
+            optim,
+            sampling_config.step_per_epoch,
+            sampling_config.step_per_collect,
+            sampling_config.num_epochs,
         )
 
-    def dist(*logits):
-        return Independent(Normal(*logits), 1)
-
     policy = PPOPolicy(
+        # nn-stuff
         actor,
         critic,
         optim,
-        dist,
-        discount_factor=args.gamma,
-        gae_lambda=args.gae_lambda,
-        max_grad_norm=args.max_grad_norm,
-        vf_coef=args.vf_coef,
-        ent_coef=args.ent_coef,
-        reward_normalization=args.rew_norm,
-        action_scaling=True,
-        action_bound_method=args.bound_action_method,
+        dist_fn=fixed_std_normal,
         lr_scheduler=lr_scheduler,
-        action_space=env.action_space,
-        eps_clip=args.eps_clip,
-        value_clip=args.value_clip,
-        dual_clip=args.dual_clip,
-        advantage_normalization=args.norm_adv,
-        recompute_advantage=args.recompute_adv
+        # env-stuff
+        action_space=train_envs.action_space,
+        action_scaling=True,
+        # general_config
+        discount_factor=general_config.gamma,
+        gae_lambda=general_config.gae_lambda,
+        reward_normalization=general_config.rew_norm,
+        action_bound_method=general_config.action_bound_method,
+        # pg_config
+        max_grad_norm=pg_config.max_grad_norm,
+        vf_coef=pg_config.vf_coef,
+        ent_coef=pg_config.ent_coef,
+        # ppo_config
+        eps_clip=ppo_config.eps_clip,
+        value_clip=ppo_config.value_clip,
+        dual_clip=ppo_config.dual_clip,
+        advantage_normalization=ppo_config.norm_adv,
+        recompute_advantage=ppo_config.recompute_adv,
     )
 
-    # load a previous policy
-    if args.resume_path:
-        policy.load_state_dict(torch.load(args.resume_path, map_location=args.device))
-        print("Loaded agent from: ", args.resume_path)
-
-    # collector
-    if args.training_num > 1:
-        buffer = VectorReplayBuffer(args.buffer_size, len(train_envs))
-    else:
-        buffer = ReplayBuffer(args.buffer_size)
-    train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
-    test_collector = Collector(policy, test_envs)
-    # log
-    t0 = datetime.datetime.now().strftime("%m%d_%H%M%S")
-    log_file = f'seed_{args.seed}_{t0}-{args.task.replace("-", "_")}_ppo'
-    log_path = os.path.join(args.logdir, args.task, 'ppo', log_file)
-    writer = SummaryWriter(log_path)
-    writer.add_text("args", str(args))
-    logger = TensorboardLogger(writer, update_interval=100, train_interval=100)
-
-    def save_fn(policy):
-        torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
-
-    if not args.watch:
-        # trainer
-        result = onpolicy_trainer(
+    if experiment_config.resume_path:
+        resume_from_checkpoint(
+            experiment_config.resume_path,
             policy,
-            train_collector,
-            test_collector,
-            args.epoch,
-            args.step_per_epoch,
-            args.repeat_per_collect,
-            args.test_num,
-            args.batch_size,
-            step_per_collect=args.step_per_collect,
-            save_fn=save_fn,
-            logger=logger,
-            test_in_train=False
+            train_envs=train_envs,
+            test_envs=test_envs,
+            device=experiment_config.device,
         )
+
+    train_collector, test_collector = get_train_test_collector(
+        sampling_config.buffer_size,
+        policy,
+        train_envs,
+        test_envs,
+        start_timesteps=sampling_config.start_timesteps,
+        start_timesteps_random=sampling_config.start_timesteps_random,
+    )
+
+    # TODO: test num is the number of test envs but used as episode_per_test
+    #  here and in watch_agent
+    if not experiment_config.watch:
+        # RL training
+        def save_best_fn(pol: nn.Module):
+            state = {"model": pol.state_dict(), "obs_rms": train_envs.get_obs_rms()}
+            torch.save(state, os.path.join(log_path, "policy.pth"))
+
+        trainer = OnpolicyTrainer(
+            policy=policy,
+            max_epoch=sampling_config.num_epochs,
+            train_collector=train_collector,
+            test_collector=test_collector,
+            step_per_epoch=sampling_config.step_per_epoch,
+            repeat_per_collect=sampling_config.repeat_per_collect,
+            episode_per_test=sampling_config.num_test_episodes,
+            batch_size=sampling_config.batch_size,
+            step_per_collect=sampling_config.step_per_collect,
+            save_best_fn=save_best_fn,
+            logger=logger,
+            test_in_train=False,
+        )
+        result = trainer.run()
         pprint.pprint(result)
 
-    # Let's watch its performance!
-    policy.eval()
-    test_envs.seed(args.seed)
-    test_collector.reset()
-    result = test_collector.collect(n_episode=args.test_num, render=args.render)
-    print(f'Final reward: {result["rews"].mean()}, length: {result["lens"].mean()}')
+    watch_agent(
+        sampling_config.num_test_episodes_per_env,
+        policy,
+        test_collector,
+        render=experiment_config.render,
+    )
 
 
-if __name__ == '__main__':
-    test_ppo()
+if __name__ == "__main__":
+    CLI(main)
