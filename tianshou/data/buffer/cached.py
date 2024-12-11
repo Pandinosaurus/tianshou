@@ -1,13 +1,11 @@
-from typing import List, Optional, Tuple, Union
-
 import numpy as np
 
-from tianshou.data import Batch, ReplayBuffer, ReplayBufferManager
+from tianshou.data import ReplayBuffer, ReplayBufferManager
+from tianshou.data.types import RolloutBatchProtocol
 
 
 class CachedReplayBuffer(ReplayBufferManager):
-    """CachedReplayBuffer contains a given main buffer and n cached buffers, \
-    ``cached_buffer_num * ReplayBuffer(size=max_episode_length)``.
+    """CachedReplayBuffer contains a given main buffer and n cached buffers, ``cached_buffer_num * ReplayBuffer(size=max_episode_length)``.
 
     The memory layout is: ``| main_buffer | cached_buffers[0] | cached_buffers[1] | ...
     | cached_buffers[cached_buffer_num - 1] |``.
@@ -15,11 +13,11 @@ class CachedReplayBuffer(ReplayBufferManager):
     The data is first stored in cached buffers. When an episode is terminated, the data
     will move to the main buffer and the corresponding cached buffer will be reset.
 
-    :param ReplayBuffer main_buffer: the main buffer whose ``.update()`` function
+    :param main_buffer: the main buffer whose ``.update()`` function
         behaves normally.
-    :param int cached_buffer_num: number of ReplayBuffer needs to be created for cached
+    :param cached_buffer_num: number of ReplayBuffer needs to be created for cached
         buffer.
-    :param int max_episode_length: the maximum length of one episode, used in each
+    :param max_episode_length: the maximum length of one episode, used in each
         cached buffer's maxsize.
 
     .. seealso::
@@ -33,12 +31,12 @@ class CachedReplayBuffer(ReplayBufferManager):
         cached_buffer_num: int,
         max_episode_length: int,
     ) -> None:
-        assert cached_buffer_num > 0 and max_episode_length > 0
-        assert type(main_buffer) == ReplayBuffer
+        assert cached_buffer_num > 0
+        assert max_episode_length > 0
+        assert isinstance(main_buffer, ReplayBuffer)
         kwargs = main_buffer.options
         buffers = [main_buffer] + [
-            ReplayBuffer(max_episode_length, **kwargs)
-            for _ in range(cached_buffer_num)
+            ReplayBuffer(max_episode_length, **kwargs) for _ in range(cached_buffer_num)
         ]
         super().__init__(buffer_list=buffers)
         self.main_buffer = self.buffers[0]
@@ -47,9 +45,9 @@ class CachedReplayBuffer(ReplayBufferManager):
 
     def add(
         self,
-        batch: Batch,
-        buffer_ids: Optional[Union[np.ndarray, List[int]]] = None
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        batch: RolloutBatchProtocol,
+        buffer_ids: np.ndarray | list[int] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Add a batch of data into CachedReplayBuffer.
 
         Each of the data's length (first dimension) must equal to the length of
@@ -61,24 +59,27 @@ class CachedReplayBuffer(ReplayBufferManager):
         cached_buffer_ids[i]th cached buffer's corresponding episode result.
         """
         if buffer_ids is None:
-            buf_arr = np.arange(1, 1 + self.cached_buffer_num)
-        else:  # make sure it is np.ndarray
-            buf_arr = np.asarray(buffer_ids) + 1
-        ptr, ep_rew, ep_len, ep_idx = super().add(batch, buffer_ids=buf_arr)
+            cached_buffer_ids = np.arange(1, 1 + self.cached_buffer_num)
+        else:  # make sure it is np.ndarray, +1 means it's never the main buffer
+            cached_buffer_ids = np.asarray(buffer_ids) + 1
+        insertion_idx, ep_return, ep_len, ep_start_idx = super().add(
+            batch,
+            buffer_ids=cached_buffer_ids,
+        )
         # find the terminated episode, move data from cached buf to main buf
-        updated_ptr, updated_ep_idx = [], []
-        done = batch.done.astype(bool)
-        for buffer_idx in buf_arr[done]:
+        updated_insertion_idx, updated_ep_start_idx = [], []
+        done = np.logical_or(batch.terminated, batch.truncated)
+        for buffer_idx in cached_buffer_ids[done]:
             index = self.main_buffer.update(self.buffers[buffer_idx])
             if len(index) == 0:  # unsuccessful move, replace with -1
                 index = [-1]
-            updated_ep_idx.append(index[0])
-            updated_ptr.append(index[-1])
+            updated_ep_start_idx.append(index[0])
+            updated_insertion_idx.append(index[-1])
             self.buffers[buffer_idx].reset()
             self._lengths[0] = len(self.main_buffer)
             self._lengths[buffer_idx] = 0
             self.last_index[0] = index[-1]
             self.last_index[buffer_idx] = self._offset[buffer_idx]
-        ptr[done] = updated_ptr
-        ep_idx[done] = updated_ep_idx
-        return ptr, ep_rew, ep_len, ep_idx
+        insertion_idx[done] = updated_insertion_idx
+        ep_start_idx[done] = updated_ep_start_idx
+        return insertion_idx, ep_return, ep_len, ep_start_idx

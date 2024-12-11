@@ -5,111 +5,114 @@ import datetime
 import os
 import pprint
 
-import gym
 import numpy as np
 import torch
+from mujoco_env import make_mujoco_env
 from torch import nn
-from torch.distributions import Independent, Normal
+from torch.distributions import Distribution, Independent, Normal
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.tensorboard import SummaryWriter
 
-from tianshou.data import Collector, ReplayBuffer, VectorReplayBuffer
-from tianshou.env import SubprocVectorEnv
+from tianshou.data import Collector, CollectStats, ReplayBuffer, VectorReplayBuffer
+from tianshou.highlevel.logger import LoggerFactoryDefault
 from tianshou.policy import TRPOPolicy
-from tianshou.trainer import onpolicy_trainer
-from tianshou.utils import TensorboardLogger
+from tianshou.policy.base import BasePolicy
+from tianshou.trainer import OnpolicyTrainer
 from tianshou.utils.net.common import Net
 from tianshou.utils.net.continuous import ActorProb, Critic
 
 
-def get_args():
+def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--task', type=str, default='HalfCheetah-v3')
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--buffer-size', type=int, default=4096)
+    parser.add_argument("--task", type=str, default="Ant-v4")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--buffer-size", type=int, default=4096)
     parser.add_argument(
-        '--hidden-sizes', type=int, nargs='*', default=[64, 64]
+        "--hidden-sizes",
+        type=int,
+        nargs="*",
+        default=[64, 64],
     )  # baselines [32, 32]
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--epoch', type=int, default=100)
-    parser.add_argument('--step-per-epoch', type=int, default=30000)
-    parser.add_argument('--step-per-collect', type=int, default=1024)
-    parser.add_argument('--repeat-per-collect', type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--epoch", type=int, default=100)
+    parser.add_argument("--step-per-epoch", type=int, default=30000)
+    parser.add_argument("--step-per-collect", type=int, default=1024)
+    parser.add_argument("--repeat-per-collect", type=int, default=1)
     # batch-size >> step-per-collect means calculating all data in one singe forward.
-    parser.add_argument('--batch-size', type=int, default=99999)
-    parser.add_argument('--training-num', type=int, default=16)
-    parser.add_argument('--test-num', type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--training-num", type=int, default=16)
+    parser.add_argument("--test-num", type=int, default=10)
     # trpo special
-    parser.add_argument('--rew-norm', type=int, default=True)
-    parser.add_argument('--gae-lambda', type=float, default=0.95)
+    parser.add_argument("--rew-norm", type=int, default=True)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
     # TODO tanh support
-    parser.add_argument('--bound-action-method', type=str, default="clip")
-    parser.add_argument('--lr-decay', type=int, default=True)
-    parser.add_argument('--logdir', type=str, default='log')
-    parser.add_argument('--render', type=float, default=0.)
-    parser.add_argument('--norm-adv', type=int, default=1)
-    parser.add_argument('--optim-critic-iters', type=int, default=20)
-    parser.add_argument('--max-kl', type=float, default=0.01)
-    parser.add_argument('--backtrack-coeff', type=float, default=0.8)
-    parser.add_argument('--max-backtracks', type=int, default=10)
+    parser.add_argument("--bound-action-method", type=str, default="clip")
+    parser.add_argument("--lr-decay", type=int, default=True)
+    parser.add_argument("--logdir", type=str, default="log")
+    parser.add_argument("--render", type=float, default=0.0)
+    parser.add_argument("--norm-adv", type=int, default=1)
+    parser.add_argument("--optim-critic-iters", type=int, default=20)
+    parser.add_argument("--max-kl", type=float, default=0.01)
+    parser.add_argument("--backtrack-coeff", type=float, default=0.8)
+    parser.add_argument("--max-backtracks", type=int, default=10)
     parser.add_argument(
-        '--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu'
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
     )
-    parser.add_argument('--resume-path', type=str, default=None)
+    parser.add_argument("--resume-path", type=str, default=None)
+    parser.add_argument("--resume-id", type=str, default=None)
     parser.add_argument(
-        '--watch',
+        "--logger",
+        type=str,
+        default="tensorboard",
+        choices=["tensorboard", "wandb"],
+    )
+    parser.add_argument("--wandb-project", type=str, default="mujoco.benchmark")
+    parser.add_argument(
+        "--watch",
         default=False,
-        action='store_true',
-        help='watch the play of pre-trained policy only'
+        action="store_true",
+        help="watch the play of pre-trained policy only",
     )
     return parser.parse_args()
 
 
-def test_trpo(args=get_args()):
-    env = gym.make(args.task)
+def test_trpo(args: argparse.Namespace = get_args()) -> None:
+    env, train_envs, test_envs = make_mujoco_env(
+        args.task,
+        args.seed,
+        args.training_num,
+        args.test_num,
+        obs_norm=True,
+    )
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
     args.max_action = env.action_space.high[0]
     print("Observations shape:", args.state_shape)
     print("Actions shape:", args.action_shape)
     print("Action range:", np.min(env.action_space.low), np.max(env.action_space.high))
-    # train_envs = gym.make(args.task)
-    train_envs = SubprocVectorEnv(
-        [lambda: gym.make(args.task) for _ in range(args.training_num)], norm_obs=True
-    )
-    # test_envs = gym.make(args.task)
-    test_envs = SubprocVectorEnv(
-        [lambda: gym.make(args.task) for _ in range(args.test_num)],
-        norm_obs=True,
-        obs_rms=train_envs.obs_rms,
-        update_obs_rms=False
-    )
-
     # seed
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    train_envs.seed(args.seed)
-    test_envs.seed(args.seed)
     # model
     net_a = Net(
         args.state_shape,
         hidden_sizes=args.hidden_sizes,
         activation=nn.Tanh,
-        device=args.device
+        device=args.device,
     )
     actor = ActorProb(
         net_a,
         args.action_shape,
-        max_action=args.max_action,
         unbounded=True,
-        device=args.device
+        device=args.device,
     ).to(args.device)
     net_c = Net(
         args.state_shape,
         hidden_sizes=args.hidden_sizes,
         activation=nn.Tanh,
-        device=args.device
+        device=args.device,
     )
     critic = Critic(net_c, device=args.device).to(args.device)
     torch.nn.init.constant_(actor.sigma_param, -0.5)
@@ -130,22 +133,19 @@ def test_trpo(args=get_args()):
     lr_scheduler = None
     if args.lr_decay:
         # decay learning rate to 0 linearly
-        max_update_num = np.ceil(
-            args.step_per_epoch / args.step_per_collect
-        ) * args.epoch
+        max_update_num = np.ceil(args.step_per_epoch / args.step_per_collect) * args.epoch
 
-        lr_scheduler = LambdaLR(
-            optim, lr_lambda=lambda epoch: 1 - epoch / max_update_num
-        )
+        lr_scheduler = LambdaLR(optim, lr_lambda=lambda epoch: 1 - epoch / max_update_num)
 
-    def dist(*logits):
-        return Independent(Normal(*logits), 1)
+    def dist(loc_scale: tuple[torch.Tensor, torch.Tensor]) -> Distribution:
+        loc, scale = loc_scale
+        return Independent(Normal(loc, scale), 1)
 
-    policy = TRPOPolicy(
-        actor,
-        critic,
-        optim,
-        dist,
+    policy: TRPOPolicy = TRPOPolicy(
+        actor=actor,
+        critic=critic,
+        optim=optim,
+        dist_fn=dist,
         discount_factor=args.gamma,
         gae_lambda=args.gae_lambda,
         reward_normalization=args.rew_norm,
@@ -157,57 +157,75 @@ def test_trpo(args=get_args()):
         optim_critic_iters=args.optim_critic_iters,
         max_kl=args.max_kl,
         backtrack_coeff=args.backtrack_coeff,
-        max_backtracks=args.max_backtracks
+        max_backtracks=args.max_backtracks,
     )
 
     # load a previous policy
     if args.resume_path:
-        policy.load_state_dict(torch.load(args.resume_path, map_location=args.device))
+        ckpt = torch.load(args.resume_path, map_location=args.device)
+        policy.load_state_dict(ckpt["model"])
+        train_envs.set_obs_rms(ckpt["obs_rms"])
+        test_envs.set_obs_rms(ckpt["obs_rms"])
         print("Loaded agent from: ", args.resume_path)
 
     # collector
+    buffer: VectorReplayBuffer | ReplayBuffer
     if args.training_num > 1:
         buffer = VectorReplayBuffer(args.buffer_size, len(train_envs))
     else:
         buffer = ReplayBuffer(args.buffer_size)
-    train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
-    test_collector = Collector(policy, test_envs)
-    # log
-    t0 = datetime.datetime.now().strftime("%m%d_%H%M%S")
-    log_file = f'seed_{args.seed}_{t0}-{args.task.replace("-", "_")}_trpo'
-    log_path = os.path.join(args.logdir, args.task, 'trpo', log_file)
-    writer = SummaryWriter(log_path)
-    writer.add_text("args", str(args))
-    logger = TensorboardLogger(writer, update_interval=100, train_interval=100)
+    train_collector = Collector[CollectStats](policy, train_envs, buffer, exploration_noise=True)
+    test_collector = Collector[CollectStats](policy, test_envs)
 
-    def save_fn(policy):
-        torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
+    # log
+    now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
+    args.algo_name = "trpo"
+    log_name = os.path.join(args.task, args.algo_name, str(args.seed), now)
+    log_path = os.path.join(args.logdir, log_name)
+
+    # logger
+    logger_factory = LoggerFactoryDefault()
+    if args.logger == "wandb":
+        logger_factory.logger_type = "wandb"
+        logger_factory.wandb_project = args.wandb_project
+    else:
+        logger_factory.logger_type = "tensorboard"
+
+    logger = logger_factory.create_logger(
+        log_dir=log_path,
+        experiment_name=log_name,
+        run_id=args.resume_id,
+        config_dict=vars(args),
+    )
+
+    def save_best_fn(policy: BasePolicy) -> None:
+        state = {"model": policy.state_dict(), "obs_rms": train_envs.get_obs_rms()}
+        torch.save(state, os.path.join(log_path, "policy.pth"))
 
     if not args.watch:
         # trainer
-        result = onpolicy_trainer(
-            policy,
-            train_collector,
-            test_collector,
-            args.epoch,
-            args.step_per_epoch,
-            args.repeat_per_collect,
-            args.test_num,
-            args.batch_size,
+        result = OnpolicyTrainer(
+            policy=policy,
+            train_collector=train_collector,
+            test_collector=test_collector,
+            max_epoch=args.epoch,
+            step_per_epoch=args.step_per_epoch,
+            repeat_per_collect=args.repeat_per_collect,
+            episode_per_test=args.test_num,
+            batch_size=args.batch_size,
             step_per_collect=args.step_per_collect,
-            save_fn=save_fn,
+            save_best_fn=save_best_fn,
             logger=logger,
-            test_in_train=False
-        )
+            test_in_train=False,
+        ).run()
         pprint.pprint(result)
 
     # Let's watch its performance!
-    policy.eval()
     test_envs.seed(args.seed)
     test_collector.reset()
-    result = test_collector.collect(n_episode=args.test_num, render=args.render)
-    print(f'Final reward: {result["rews"].mean()}, length: {result["lens"].mean()}')
+    collector_stats = test_collector.collect(n_episode=args.test_num, render=args.render)
+    print(collector_stats)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     test_trpo()

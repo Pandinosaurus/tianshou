@@ -1,5 +1,3 @@
-from typing import Optional, Union
-
 import numpy as np
 from numba import njit
 
@@ -15,7 +13,7 @@ class SegmentTree:
     segment tree have the same depth.
     2. Store the segment tree in a binary heap.
 
-    :param int size: the size of segment tree.
+    :param size: the size of segment tree.
     """
 
     def __init__(self, size: int) -> None:
@@ -30,13 +28,11 @@ class SegmentTree:
     def __len__(self) -> int:
         return self._size
 
-    def __getitem__(self, index: Union[int, np.ndarray]) -> Union[float, np.ndarray]:
+    def __getitem__(self, index: int | np.ndarray) -> float | np.ndarray:
         """Return self[index]."""
         return self._value[index + self._bound]
 
-    def __setitem__(
-        self, index: Union[int, np.ndarray], value: Union[float, np.ndarray]
-    ) -> None:
+    def __setitem__(self, index: int | np.ndarray, value: float | np.ndarray) -> None:
         """Update values in segment tree.
 
         Duplicate values in ``index`` are handled by numpy: later index
@@ -50,10 +46,11 @@ class SegmentTree:
         """
         if isinstance(index, int):
             index, value = np.array([index]), np.array([value])
-        assert np.all(0 <= index) and np.all(index < self._size)
+        assert np.all(index >= 0)
+        assert np.all(index < self._size)
         _setitem(self._value, index + self._bound, value)
 
-    def reduce(self, start: int = 0, end: Optional[int] = None) -> float:
+    def reduce(self, start: int = 0, end: int | None = None) -> float:
         """Return operation(value[start:end])."""
         if start == 0 and end is None:
             return self._value[1]
@@ -63,8 +60,7 @@ class SegmentTree:
             end += self._size
         return _reduce(self._value, start + self._bound - 1, end + self._bound)
 
-    def get_prefix_sum_idx(self, value: Union[float,
-                                              np.ndarray]) -> Union[int, np.ndarray]:
+    def get_prefix_sum_idx(self, value: float | np.ndarray) -> int | np.ndarray:
         r"""Find the index with given value.
 
         Return the minimum index for each ``v`` in ``value`` so that
@@ -76,7 +72,8 @@ class SegmentTree:
             Please make sure all of the values inside the segment tree are
             non-negative when using this function.
         """
-        assert np.all(value >= 0.0) and np.all(value < self._value[1])
+        assert np.all(value >= 0.0)
+        assert np.all(value < self._value[1])
         single = False
         if not isinstance(value, np.ndarray):
             value = np.array([value])

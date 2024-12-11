@@ -1,22 +1,52 @@
-from typing import Any, Dict, Optional, Union
+from typing import Any, Literal, Self, TypeVar
 
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from tianshou.data import Batch, ReplayBuffer, to_numpy, to_torch
+from tianshou.data.batch import BatchProtocol
+from tianshou.data.types import ActBatchProtocol, ObsBatchProtocol, RolloutBatchProtocol
 from tianshou.policy import BasePolicy
+from tianshou.policy.base import (
+    TLearningRateScheduler,
+    TrainingStats,
+    TrainingStatsWrapper,
+    TTrainingStats,
+)
 from tianshou.utils.net.discrete import IntrinsicCuriosityModule
 
 
-class ICMPolicy(BasePolicy):
+class ICMTrainingStats(TrainingStatsWrapper):
+    def __init__(
+        self,
+        wrapped_stats: TrainingStats,
+        *,
+        icm_loss: float,
+        icm_forward_loss: float,
+        icm_inverse_loss: float,
+    ) -> None:
+        self.icm_loss = icm_loss
+        self.icm_forward_loss = icm_forward_loss
+        self.icm_inverse_loss = icm_inverse_loss
+        super().__init__(wrapped_stats)
+
+
+class ICMPolicy(BasePolicy[ICMTrainingStats]):
     """Implementation of Intrinsic Curiosity Module. arXiv:1705.05363.
 
-    :param BasePolicy policy: a base policy to add ICM to.
-    :param IntrinsicCuriosityModule model: the ICM model.
-    :param torch.optim.Optimizer optim: a torch.optim for optimizing the model.
-    :param float lr_scale: the scaling factor for ICM learning.
-    :param float forward_loss_weight: the weight for forward model loss.
+    :param policy: a base policy to add ICM to.
+    :param model: the ICM model.
+    :param optim: a torch.optim for optimizing the model.
+    :param lr_scale: the scaling factor for ICM learning.
+    :param forward_loss_weight: the weight for forward model loss.
+    :param observation_space: Env's observation space.
+    :param action_scaling: if True, scale the action from [-1, 1] to the range
+        of action_space. Only used if the action_space is continuous.
+    :param action_bound_method: method to bound action to range [-1, 1].
+        Only used if the action_space is continuous.
+    :param lr_scheduler: if not None, will be called in `policy.update()`.
 
     .. seealso::
 
@@ -26,15 +56,26 @@ class ICMPolicy(BasePolicy):
 
     def __init__(
         self,
-        policy: BasePolicy,
+        *,
+        policy: BasePolicy[TTrainingStats],
         model: IntrinsicCuriosityModule,
         optim: torch.optim.Optimizer,
         lr_scale: float,
         reward_scale: float,
         forward_loss_weight: float,
-        **kwargs: Any,
+        action_space: gym.Space,
+        observation_space: gym.Space | None = None,
+        action_scaling: bool = False,
+        action_bound_method: Literal["clip", "tanh"] | None = "clip",
+        lr_scheduler: TLearningRateScheduler | None = None,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(
+            action_space=action_space,
+            observation_space=observation_space,
+            action_scaling=action_scaling,
+            action_bound_method=action_bound_method,
+            lr_scheduler=lr_scheduler,
+        )
         self.policy = policy
         self.model = model
         self.optim = optim
@@ -42,7 +83,7 @@ class ICMPolicy(BasePolicy):
         self.reward_scale = reward_scale
         self.forward_loss_weight = forward_loss_weight
 
-    def train(self, mode: bool = True) -> "ICMPolicy":
+    def train(self, mode: bool = True) -> Self:
         """Set the module in training mode."""
         self.policy.train(mode)
         self.training = mode
@@ -51,10 +92,10 @@ class ICMPolicy(BasePolicy):
 
     def forward(
         self,
-        batch: Batch,
-        state: Optional[Union[dict, Batch, np.ndarray]] = None,
+        batch: ObsBatchProtocol,
+        state: dict | BatchProtocol | np.ndarray | None = None,
         **kwargs: Any,
-    ) -> Batch:
+    ) -> ActBatchProtocol:
         """Compute action over the given batch data by inner policy.
 
         .. seealso::
@@ -64,20 +105,28 @@ class ICMPolicy(BasePolicy):
         """
         return self.policy.forward(batch, state, **kwargs)
 
-    def exploration_noise(self, act: Union[np.ndarray, Batch],
-                          batch: Batch) -> Union[np.ndarray, Batch]:
+    _TArrOrActBatch = TypeVar("_TArrOrActBatch", bound="np.ndarray | ActBatchProtocol")
+
+    def exploration_noise(
+        self,
+        act: _TArrOrActBatch,
+        batch: ObsBatchProtocol,
+    ) -> _TArrOrActBatch:
         return self.policy.exploration_noise(act, batch)
 
     def set_eps(self, eps: float) -> None:
         """Set the eps for epsilon-greedy exploration."""
         if hasattr(self.policy, "set_eps"):
-            self.policy.set_eps(eps)  # type: ignore
+            self.policy.set_eps(eps)
         else:
-            raise NotImplementedError()
+            raise NotImplementedError
 
     def process_fn(
-        self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
-    ) -> Batch:
+        self,
+        batch: RolloutBatchProtocol,
+        buffer: ReplayBuffer,
+        indices: np.ndarray,
+    ) -> RolloutBatchProtocol:
         """Pre-process the data from the provided replay buffer.
 
         Used in :meth:`update`. Check out :ref:`process_fn` for more information.
@@ -88,7 +137,10 @@ class ICMPolicy(BasePolicy):
         return self.policy.process_fn(batch, buffer, indices)
 
     def post_process_fn(
-        self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
+        self,
+        batch: BatchProtocol,
+        buffer: ReplayBuffer,
+        indices: np.ndarray,
     ) -> None:
         """Post-process the data from the provided replay buffer.
 
@@ -98,24 +150,27 @@ class ICMPolicy(BasePolicy):
         self.policy.post_process_fn(batch, buffer, indices)
         batch.rew = batch.policy.orig_rew  # restore original reward
 
-    def learn(self, batch: Batch, **kwargs: Any) -> Dict[str, float]:
-        res = self.policy.learn(batch, **kwargs)
+    def learn(
+        self,
+        batch: RolloutBatchProtocol,
+        *args: Any,
+        **kwargs: Any,
+    ) -> ICMTrainingStats:
+        training_stat = self.policy.learn(batch, **kwargs)
         self.optim.zero_grad()
         act_hat = batch.policy.act_hat
         act = to_torch(batch.act, dtype=torch.long, device=act_hat.device)
-        inverse_loss = F.cross_entropy(act_hat, act).mean()  # type: ignore
+        inverse_loss = F.cross_entropy(act_hat, act).mean()
         forward_loss = batch.policy.mse_loss.mean()
         loss = (
-            (1 - self.forward_loss_weight) * inverse_loss +
-            self.forward_loss_weight * forward_loss
+            (1 - self.forward_loss_weight) * inverse_loss + self.forward_loss_weight * forward_loss
         ) * self.lr_scale
         loss.backward()
         self.optim.step()
-        res.update(
-            {
-                "loss/icm": loss.item(),
-                "loss/icm/forward": forward_loss.item(),
-                "loss/icm/inverse": inverse_loss.item()
-            }
+
+        return ICMTrainingStats(
+            training_stat,
+            icm_loss=loss.item(),
+            icm_forward_loss=forward_loss.item(),
+            icm_inverse_loss=inverse_loss.item(),
         )
-        return res

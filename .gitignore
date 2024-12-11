@@ -111,7 +111,7 @@ celerybeat.pid
 .env
 .venv
 venv/
-ENV/
+/ENV/
 env.bak/
 venv.bak/
 
@@ -149,3 +149,13 @@ MUJOCO_LOG.TXT
 *.hdf5
 wandb/
 videos/
+
+# might be needed for IDE plugins that can't read ruff config
+.flake8
+
+docs/notebooks/_build/
+docs/conf.py
+
+# temporary scripts (for ad-hoc testing), temp folder
+/temp
+/temp*.py

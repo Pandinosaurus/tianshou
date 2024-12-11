@@ -1,18 +1,15 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Sequence, Union
+from collections.abc import Sequence
 
 import numpy as np
 
 
-class BaseNoise(ABC, object):
+class BaseNoise(ABC):
     """The action noise base class."""
 
-    def __init__(self) -> None:
-        super().__init__()
-
+    @abstractmethod
     def reset(self) -> None:
         """Reset to the initial state."""
-        pass
 
     @abstractmethod
     def __call__(self, size: Sequence[int]) -> np.ndarray:
@@ -24,13 +21,15 @@ class GaussianNoise(BaseNoise):
     """The vanilla Gaussian process, for exploration in DDPG by default."""
 
     def __init__(self, mu: float = 0.0, sigma: float = 1.0) -> None:
-        super().__init__()
         self._mu = mu
-        assert 0 <= sigma, "Noise std should not be negative."
+        assert sigma >= 0, "Noise std should not be negative."
         self._sigma = sigma
 
     def __call__(self, size: Sequence[int]) -> np.ndarray:
         return np.random.normal(self._mu, self._sigma, size)
+
+    def reset(self) -> None:
+        pass
 
 
 class OUNoise(BaseNoise):
@@ -56,7 +55,7 @@ class OUNoise(BaseNoise):
         sigma: float = 0.3,
         theta: float = 0.15,
         dt: float = 1e-2,
-        x0: Optional[Union[float, np.ndarray]] = None,
+        x0: float | np.ndarray | None = None,
     ) -> None:
         super().__init__()
         self._mu = mu
@@ -69,14 +68,12 @@ class OUNoise(BaseNoise):
         """Reset to the initial state."""
         self._x = self._x0
 
-    def __call__(self, size: Sequence[int], mu: Optional[float] = None) -> np.ndarray:
+    def __call__(self, size: Sequence[int], mu: float | None = None) -> np.ndarray:
         """Generate new noise.
 
         Return an numpy array which size is equal to ``size``.
         """
-        if self._x is None or isinstance(
-            self._x, np.ndarray
-        ) and self._x.shape != size:
+        if self._x is None or isinstance(self._x, np.ndarray) and self._x.shape != size:
             self._x = 0.0
         if mu is None:
             mu = self._mu

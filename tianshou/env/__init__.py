@@ -1,6 +1,12 @@
 """Env package."""
 
-from tianshou.env.maenv import MultiAgentEnv
+from tianshou.env.gym_wrappers import (
+    ContinuousToDiscrete,
+    MultiDiscreteToDiscrete,
+    TruncatedAsTerminated,
+)
+from tianshou.env.pettingzoo_env import PettingZooEnv
+from tianshou.env.venv_wrappers import VectorEnvNormObs, VectorEnvWrapper
 from tianshou.env.venvs import (
     BaseVectorEnv,
     DummyVectorEnv,
@@ -15,5 +21,10 @@ __all__ = [
     "SubprocVectorEnv",
     "ShmemVectorEnv",
     "RayVectorEnv",
-    "MultiAgentEnv",
+    "VectorEnvWrapper",
+    "VectorEnvNormObs",
+    "PettingZooEnv",
+    "ContinuousToDiscrete",
+    "MultiDiscreteToDiscrete",
+    "TruncatedAsTerminated",
 ]

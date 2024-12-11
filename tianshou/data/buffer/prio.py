@@ -1,17 +1,20 @@
-from typing import Any, List, Optional, Tuple, Union
+from collections.abc import Sequence
+from typing import Any, cast
 
 import numpy as np
 import torch
 
-from tianshou.data import Batch, ReplayBuffer, SegmentTree, to_numpy
+from tianshou.data import ReplayBuffer, SegmentTree, to_numpy
+from tianshou.data.batch import IndexType
+from tianshou.data.types import PrioBatchProtocol, RolloutBatchProtocol
 
 
 class PrioritizedReplayBuffer(ReplayBuffer):
     """Implementation of Prioritized Experience Replay. arXiv:1511.05952.
 
-    :param float alpha: the prioritization exponent.
-    :param float beta: the importance sample soft coefficient.
-    :param bool weight_norm: whether to normalize returned weights with the maximum
+    :param alpha: the prioritization exponent.
+    :param beta: the importance sample soft coefficient.
+    :param weight_norm: whether to normalize returned weights with the maximum
         weight value within the batch. Default to True.
 
     .. seealso::
@@ -25,12 +28,13 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         alpha: float,
         beta: float,
         weight_norm: bool = True,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         # will raise KeyError in PrioritizedVectorReplayBuffer
         # super().__init__(size, **kwargs)
         ReplayBuffer.__init__(self, size, **kwargs)
-        assert alpha > 0.0 and beta >= 0.0
+        assert alpha > 0.0
+        assert beta >= 0.0
         self._alpha, self._beta = alpha, beta
         self._max_prio = self._min_prio = 1.0
         # save weight directly in this class instead of self._meta
@@ -39,7 +43,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         self.options.update(alpha=alpha, beta=beta)
         self._weight_norm = weight_norm
 
-    def init_weight(self, index: Union[int, np.ndarray]) -> None:
+    def init_weight(self, index: int | np.ndarray) -> None:
         self.weight[index] = self._max_prio**self._alpha
 
     def update(self, buffer: ReplayBuffer) -> np.ndarray:
@@ -49,21 +53,20 @@ class PrioritizedReplayBuffer(ReplayBuffer):
 
     def add(
         self,
-        batch: Batch,
-        buffer_ids: Optional[Union[np.ndarray, List[int]]] = None
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        batch: RolloutBatchProtocol,
+        buffer_ids: np.ndarray | list[int] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         ptr, ep_rew, ep_len, ep_idx = super().add(batch, buffer_ids)
         self.init_weight(ptr)
         return ptr, ep_rew, ep_len, ep_idx
 
-    def sample_indices(self, batch_size: int) -> np.ndarray:
-        if batch_size > 0 and len(self) > 0:
+    def sample_indices(self, batch_size: int | None) -> np.ndarray:
+        if batch_size is not None and batch_size > 0 and len(self) > 0:
             scalar = np.random.rand(batch_size) * self.weight.reduce()
             return self.weight.get_prefix_sum_idx(scalar)  # type: ignore
-        else:
-            return super().sample_indices(batch_size)
+        return super().sample_indices(batch_size)
 
-    def get_weight(self, index: Union[int, np.ndarray]) -> Union[float, np.ndarray]:
+    def get_weight(self, index: int | np.ndarray) -> float | np.ndarray:
         """Get the importance sampling weight.
 
         The "weight" in the returned Batch is the weight on loss function to debias
@@ -73,11 +76,9 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         # important sampling weight calculation
         # original formula: ((p_j/p_sum*N)**(-beta))/((p_min/p_sum*N)**(-beta))
         # simplified formula: (p_j/p_min)**(-beta)
-        return (self.weight[index] / self._min_prio)**(-self._beta)
+        return (self.weight[index] / self._min_prio) ** (-self._beta)
 
-    def update_weight(
-        self, index: np.ndarray, new_weight: Union[np.ndarray, torch.Tensor]
-    ) -> None:
+    def update_weight(self, index: np.ndarray, new_weight: np.ndarray | torch.Tensor) -> None:
         """Update priority weight by index in this buffer.
 
         :param np.ndarray index: index you want to update weight.
@@ -88,18 +89,25 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         self._max_prio = max(self._max_prio, weight.max())
         self._min_prio = min(self._min_prio, weight.min())
 
-    def __getitem__(self, index: Union[slice, int, List[int], np.ndarray]) -> Batch:
+    def __getitem__(self, index: IndexType) -> PrioBatchProtocol:
+        indices: Sequence[int] | np.ndarray
         if isinstance(index, slice):  # change slice to np array
             # buffer[:] will get all available data
-            indices = self.sample_indices(0) if index == slice(None) \
-                else self._indices[:len(self)][index]
+            indices = (
+                self.sample_indices(0)
+                if index == slice(None)
+                else self._indices[: len(self)][index]
+            )
         else:
-            indices = index
+            indices = cast(np.ndarray, index)
         batch = super().__getitem__(indices)
         weight = self.get_weight(indices)
         # ref: https://github.com/Kaixhin/Rainbow/blob/master/memory.py L154
         batch.weight = weight / np.max(weight) if self._weight_norm else weight
-        return batch
+        return cast(PrioBatchProtocol, batch)
+
+    def sample(self, batch_size: int | None) -> tuple[PrioBatchProtocol, np.ndarray]:
+        return cast(tuple[PrioBatchProtocol, np.ndarray], super().sample(batch_size=batch_size))
 
     def set_beta(self, beta: float) -> None:
         self._beta = beta

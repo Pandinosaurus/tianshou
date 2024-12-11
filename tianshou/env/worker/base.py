@@ -1,8 +1,11 @@
 from abc import ABC, abstractmethod
-from typing import Any, Callable, List, Optional, Tuple, Union
+from collections.abc import Callable
+from typing import Any
 
-import gym
+import gymnasium as gym
 import numpy as np
+
+from tianshou.env.utils import gym_new_venv_step_type
 
 
 class EnvWorker(ABC):
@@ -11,8 +14,9 @@ class EnvWorker(ABC):
     def __init__(self, env_fn: Callable[[], gym.Env]) -> None:
         self._env_fn = env_fn
         self.is_closed = False
-        self.result: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
-        self.action_space = self.get_env_attr("action_space")  # noqa: B009
+        self.result: gym_new_venv_step_type | tuple[np.ndarray, dict]
+        self.action_space = self.get_env_attr("action_space")
+        self.is_reset = False
 
     @abstractmethod
     def get_env_attr(self, key: str) -> Any:
@@ -23,33 +27,29 @@ class EnvWorker(ABC):
         pass
 
     @abstractmethod
-    def send(self, action: Optional[np.ndarray]) -> None:
+    def send(self, action: np.ndarray | None) -> None:
         """Send action signal to low-level worker.
 
         When action is None, it indicates sending "reset" signal; otherwise
         it indicates "step" signal. The paired return value from "recv"
         function is determined by such kind of different signal.
         """
-        pass
 
-    def recv(
-        self
-    ) -> Union[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
+    def recv(self) -> gym_new_venv_step_type | tuple[np.ndarray, dict]:
         """Receive result from low-level worker.
 
         If the last "send" function sends a NULL action, it only returns a
         single observation; otherwise it returns a tuple of (obs, rew, done,
-        info).
+        info) or (obs, rew, terminated, truncated, info), based on whether
+        the environment is using the old step API or the new one.
         """
         return self.result
 
-    def reset(self) -> np.ndarray:
-        self.send(None)
-        return self.recv()  # type: ignore
+    @abstractmethod
+    def reset(self, **kwargs: Any) -> tuple[np.ndarray, dict]:
+        pass
 
-    def step(
-        self, action: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def step(self, action: np.ndarray) -> gym_new_venv_step_type:
         """Perform one timestep of the environment's dynamic.
 
         "send" and "recv" are coupled in sync simulation, so users only call
@@ -61,20 +61,19 @@ class EnvWorker(ABC):
 
     @staticmethod
     def wait(
-        workers: List["EnvWorker"],
+        workers: list["EnvWorker"],
         wait_num: int,
-        timeout: Optional[float] = None
-    ) -> List["EnvWorker"]:
+        timeout: float | None = None,
+    ) -> list["EnvWorker"]:
         """Given a list of workers, return those ready ones."""
         raise NotImplementedError
 
-    def seed(self, seed: Optional[int] = None) -> Optional[List[int]]:
+    def seed(self, seed: int | None = None) -> list[int] | None:
         return self.action_space.seed(seed)  # issue 299
 
     @abstractmethod
     def render(self, **kwargs: Any) -> Any:
         """Render the environment."""
-        pass
 
     @abstractmethod
     def close_env(self) -> None:
@@ -82,6 +81,6 @@ class EnvWorker(ABC):
 
     def close(self) -> None:
         if self.is_closed:
-            return None
+            return
         self.is_closed = True
         self.close_env()

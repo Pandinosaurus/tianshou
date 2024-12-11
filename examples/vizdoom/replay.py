@@ -1,4 +1,5 @@
 # import cv2
+import os
 import sys
 import time
 
@@ -6,7 +7,10 @@ import tqdm
 import vizdoom as vzd
 
 
-def main(cfg_path="maps/D3_battle.cfg", lmp_path="test.lmp"):
+def main(
+    cfg_path: str = os.path.join("maps", "D3_battle.cfg"),
+    lmp_path: str = os.path.join("test.lmp"),
+) -> None:
     game = vzd.DoomGame()
     game.load_config(cfg_path)
     game.set_screen_format(vzd.ScreenFormat.CRCGCB)
@@ -32,5 +36,5 @@ def main(cfg_path="maps/D3_battle.cfg", lmp_path="test.lmp"):
     print("killcount:", killcount)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main(*sys.argv[-2:])

@@ -1,6 +1,7 @@
-from typing import Any, Callable, List, Optional
+from collections.abc import Callable
+from typing import Any
 
-import gym
+import gymnasium as gym
 import numpy as np
 
 from tianshou.env.worker import EnvWorker
@@ -17,27 +18,35 @@ class DummyEnvWorker(EnvWorker):
         return getattr(self.env, key)
 
     def set_env_attr(self, key: str, value: Any) -> None:
-        setattr(self.env, key, value)
+        setattr(self.env.unwrapped, key, value)
 
-    def reset(self) -> Any:
-        return self.env.reset()
+    def reset(self, **kwargs: Any) -> tuple[np.ndarray, dict]:
+        if "seed" in kwargs:
+            super().seed(kwargs["seed"])
+        return self.env.reset(**kwargs)
 
     @staticmethod
     def wait(  # type: ignore
-        workers: List["DummyEnvWorker"], wait_num: int, timeout: Optional[float] = None
-    ) -> List["DummyEnvWorker"]:
+        workers: list["DummyEnvWorker"],
+        wait_num: int,
+        timeout: float | None = None,
+    ) -> list["DummyEnvWorker"]:
         # Sequential EnvWorker objects are always ready
         return workers
 
-    def send(self, action: Optional[np.ndarray]) -> None:
+    def send(self, action: np.ndarray | None, **kwargs: Any) -> None:
         if action is None:
-            self.result = self.env.reset()
+            self.result = self.env.reset(**kwargs)
         else:
-            self.result = self.env.step(action)
+            self.result = self.env.step(action)  # type: ignore
 
-    def seed(self, seed: Optional[int] = None) -> List[int]:
+    def seed(self, seed: int | None = None) -> list[int] | None:
         super().seed(seed)
-        return self.env.seed(seed)
+        try:
+            return self.env.seed(seed)  # type: ignore
+        except (AttributeError, NotImplementedError):
+            self.env.reset(seed=seed)
+            return [seed]  # type: ignore
 
     def render(self, **kwargs: Any) -> Any:
         return self.env.render(**kwargs)

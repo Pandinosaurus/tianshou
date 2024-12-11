@@ -1,121 +1,115 @@
 import argparse
+import datetime
 import os
 import pprint
+import sys
 
 import numpy as np
 import torch
 from atari_network import DQN
-from atari_wrapper import wrap_deepmind
-from torch.utils.tensorboard import SummaryWriter
+from atari_wrapper import make_atari_env
 
-from tianshou.data import Collector, VectorReplayBuffer
-from tianshou.env import ShmemVectorEnv
+from tianshou.data import Collector, CollectStats, VectorReplayBuffer
+from tianshou.highlevel.logger import LoggerFactoryDefault
 from tianshou.policy import FQFPolicy
-from tianshou.trainer import offpolicy_trainer
-from tianshou.utils import TensorboardLogger
+from tianshou.policy.base import BasePolicy
+from tianshou.trainer import OffpolicyTrainer
 from tianshou.utils.net.discrete import FractionProposalNetwork, FullQuantileFunction
 
 
-def get_args():
+def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--task', type=str, default='PongNoFrameskip-v4')
-    parser.add_argument('--seed', type=int, default=3128)
-    parser.add_argument('--eps-test', type=float, default=0.005)
-    parser.add_argument('--eps-train', type=float, default=1.)
-    parser.add_argument('--eps-train-final', type=float, default=0.05)
-    parser.add_argument('--buffer-size', type=int, default=100000)
-    parser.add_argument('--lr', type=float, default=5e-5)
-    parser.add_argument('--fraction-lr', type=float, default=2.5e-9)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--num-fractions', type=int, default=32)
-    parser.add_argument('--num-cosines', type=int, default=64)
-    parser.add_argument('--ent-coef', type=float, default=10.)
-    parser.add_argument('--hidden-sizes', type=int, nargs='*', default=[512])
-    parser.add_argument('--n-step', type=int, default=3)
-    parser.add_argument('--target-update-freq', type=int, default=500)
-    parser.add_argument('--epoch', type=int, default=100)
-    parser.add_argument('--step-per-epoch', type=int, default=100000)
-    parser.add_argument('--step-per-collect', type=int, default=10)
-    parser.add_argument('--update-per-step', type=float, default=0.1)
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--training-num', type=int, default=10)
-    parser.add_argument('--test-num', type=int, default=10)
-    parser.add_argument('--logdir', type=str, default='log')
-    parser.add_argument('--render', type=float, default=0.)
+    parser.add_argument("--task", type=str, default="PongNoFrameskip-v4")
+    parser.add_argument("--seed", type=int, default=3128)
+    parser.add_argument("--scale-obs", type=int, default=0)
+    parser.add_argument("--eps-test", type=float, default=0.005)
+    parser.add_argument("--eps-train", type=float, default=1.0)
+    parser.add_argument("--eps-train-final", type=float, default=0.05)
+    parser.add_argument("--buffer-size", type=int, default=100000)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--fraction-lr", type=float, default=2.5e-9)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--num-fractions", type=int, default=32)
+    parser.add_argument("--num-cosines", type=int, default=64)
+    parser.add_argument("--ent-coef", type=float, default=10.0)
+    parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[512])
+    parser.add_argument("--n-step", type=int, default=3)
+    parser.add_argument("--target-update-freq", type=int, default=500)
+    parser.add_argument("--epoch", type=int, default=100)
+    parser.add_argument("--step-per-epoch", type=int, default=100000)
+    parser.add_argument("--step-per-collect", type=int, default=10)
+    parser.add_argument("--update-per-step", type=float, default=0.1)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--training-num", type=int, default=10)
+    parser.add_argument("--test-num", type=int, default=10)
+    parser.add_argument("--logdir", type=str, default="log")
+    parser.add_argument("--render", type=float, default=0.0)
     parser.add_argument(
-        '--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu'
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
     )
-    parser.add_argument('--frames-stack', type=int, default=4)
-    parser.add_argument('--resume-path', type=str, default=None)
+    parser.add_argument("--frames-stack", type=int, default=4)
+    parser.add_argument("--resume-path", type=str, default=None)
+    parser.add_argument("--resume-id", type=str, default=None)
     parser.add_argument(
-        '--watch',
+        "--logger",
+        type=str,
+        default="tensorboard",
+        choices=["tensorboard", "wandb"],
+    )
+    parser.add_argument("--wandb-project", type=str, default="atari.benchmark")
+    parser.add_argument(
+        "--watch",
         default=False,
-        action='store_true',
-        help='watch the play of pre-trained policy only'
+        action="store_true",
+        help="watch the play of pre-trained policy only",
     )
-    parser.add_argument('--save-buffer-name', type=str, default=None)
+    parser.add_argument("--save-buffer-name", type=str, default=None)
     return parser.parse_args()
 
 
-def make_atari_env(args):
-    return wrap_deepmind(args.task, frame_stack=args.frames_stack)
-
-
-def make_atari_env_watch(args):
-    return wrap_deepmind(
+def test_fqf(args: argparse.Namespace = get_args()) -> None:
+    env, train_envs, test_envs = make_atari_env(
         args.task,
+        args.seed,
+        args.training_num,
+        args.test_num,
+        scale=args.scale_obs,
         frame_stack=args.frames_stack,
-        episode_life=False,
-        clip_rewards=False
     )
-
-
-def test_fqf(args=get_args()):
-    env = make_atari_env(args)
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
     # should be N_FRAMES x H x W
     print("Observations shape:", args.state_shape)
     print("Actions shape:", args.action_shape)
-    # make environments
-    train_envs = ShmemVectorEnv(
-        [lambda: make_atari_env(args) for _ in range(args.training_num)]
-    )
-    test_envs = ShmemVectorEnv(
-        [lambda: make_atari_env_watch(args) for _ in range(args.test_num)]
-    )
     # seed
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    train_envs.seed(args.seed)
-    test_envs.seed(args.seed)
     # define model
-    feature_net = DQN(
-        *args.state_shape, args.action_shape, args.device, features_only=True
-    )
+    feature_net = DQN(*args.state_shape, args.action_shape, args.device, features_only=True)
     net = FullQuantileFunction(
         feature_net,
         args.action_shape,
         args.hidden_sizes,
         args.num_cosines,
-        device=args.device
+        device=args.device,
     ).to(args.device)
     optim = torch.optim.Adam(net.parameters(), lr=args.lr)
     fraction_net = FractionProposalNetwork(args.num_fractions, net.input_dim)
-    fraction_optim = torch.optim.RMSprop(
-        fraction_net.parameters(), lr=args.fraction_lr
-    )
+    fraction_optim = torch.optim.RMSprop(fraction_net.parameters(), lr=args.fraction_lr)
     # define policy
-    policy = FQFPolicy(
-        net,
-        optim,
-        fraction_net,
-        fraction_optim,
-        args.gamma,
-        args.num_fractions,
-        args.ent_coef,
-        args.n_step,
-        target_update_freq=args.target_update_freq
+    policy: FQFPolicy = FQFPolicy(
+        model=net,
+        optim=optim,
+        fraction_model=fraction_net,
+        fraction_optim=fraction_optim,
+        action_space=env.action_space,
+        discount_factor=args.gamma,
+        num_fractions=args.num_fractions,
+        ent_coef=args.ent_coef,
+        estimation_step=args.n_step,
+        target_update_freq=args.target_update_freq,
     ).to(args.device)
     # load a previous policy
     if args.resume_path:
@@ -128,46 +122,59 @@ def test_fqf(args=get_args()):
         buffer_num=len(train_envs),
         ignore_obs_next=True,
         save_only_last_obs=True,
-        stack_num=args.frames_stack
+        stack_num=args.frames_stack,
     )
     # collector
-    train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
-    test_collector = Collector(policy, test_envs, exploration_noise=True)
+    train_collector = Collector[CollectStats](policy, train_envs, buffer, exploration_noise=True)
+    test_collector = Collector[CollectStats](policy, test_envs, exploration_noise=True)
+
     # log
-    log_path = os.path.join(args.logdir, args.task, 'fqf')
-    writer = SummaryWriter(log_path)
-    writer.add_text("args", str(args))
-    logger = TensorboardLogger(writer)
+    now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
+    args.algo_name = "fqf"
+    log_name = os.path.join(args.task, args.algo_name, str(args.seed), now)
+    log_path = os.path.join(args.logdir, log_name)
 
-    def save_fn(policy):
-        torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
+    # logger
+    logger_factory = LoggerFactoryDefault()
+    if args.logger == "wandb":
+        logger_factory.logger_type = "wandb"
+        logger_factory.wandb_project = args.wandb_project
+    else:
+        logger_factory.logger_type = "tensorboard"
 
-    def stop_fn(mean_rewards):
+    logger = logger_factory.create_logger(
+        log_dir=log_path,
+        experiment_name=log_name,
+        run_id=args.resume_id,
+        config_dict=vars(args),
+    )
+
+    def save_best_fn(policy: BasePolicy) -> None:
+        torch.save(policy.state_dict(), os.path.join(log_path, "policy.pth"))
+
+    def stop_fn(mean_rewards: float) -> bool:
         if env.spec.reward_threshold:
             return mean_rewards >= env.spec.reward_threshold
-        elif 'Pong' in args.task:
+        if "Pong" in args.task:
             return mean_rewards >= 20
-        else:
-            return False
+        return False
 
-    def train_fn(epoch, env_step):
+    def train_fn(epoch: int, env_step: int) -> None:
         # nature DQN setting, linear decay in the first 1M steps
         if env_step <= 1e6:
-            eps = args.eps_train - env_step / 1e6 * \
-                (args.eps_train - args.eps_train_final)
+            eps = args.eps_train - env_step / 1e6 * (args.eps_train - args.eps_train_final)
         else:
             eps = args.eps_train_final
         policy.set_eps(eps)
         if env_step % 1000 == 0:
             logger.write("train/env_step", env_step, {"train/eps": eps})
 
-    def test_fn(epoch, env_step):
+    def test_fn(epoch: int, env_step: int | None) -> None:
         policy.set_eps(args.eps_test)
 
     # watch agent's performance
-    def watch():
+    def watch() -> None:
         print("Setup test envs ...")
-        policy.eval()
         policy.set_eps(args.eps_test)
         test_envs.seed(args.seed)
         if args.save_buffer_name:
@@ -177,9 +184,9 @@ def test_fqf(args=get_args()):
                 buffer_num=len(test_envs),
                 ignore_obs_next=True,
                 save_only_last_obs=True,
-                stack_num=args.frames_stack
+                stack_num=args.frames_stack,
             )
-            collector = Collector(policy, test_envs, buffer, exploration_noise=True)
+            collector = Collector[CollectStats](policy, test_envs, buffer, exploration_noise=True)
             result = collector.collect(n_step=args.buffer_size)
             print(f"Save buffer into {args.save_buffer_name}")
             # Unfortunately, pickle will cause oom with 1M buffer size
@@ -187,40 +194,38 @@ def test_fqf(args=get_args()):
         else:
             print("Testing agent ...")
             test_collector.reset()
-            result = test_collector.collect(
-                n_episode=args.test_num, render=args.render
-            )
-        rew = result["rews"].mean()
-        print(f'Mean reward (over {result["n/ep"]} episodes): {rew}')
+            result = test_collector.collect(n_episode=args.test_num, render=args.render)
+        result.pprint_asdict()
 
     if args.watch:
         watch()
-        exit(0)
+        sys.exit(0)
 
     # test train_collector and start filling replay buffer
+    train_collector.reset()
     train_collector.collect(n_step=args.batch_size * args.training_num)
     # trainer
-    result = offpolicy_trainer(
-        policy,
-        train_collector,
-        test_collector,
-        args.epoch,
-        args.step_per_epoch,
-        args.step_per_collect,
-        args.test_num,
-        args.batch_size,
+    result = OffpolicyTrainer(
+        policy=policy,
+        train_collector=train_collector,
+        test_collector=test_collector,
+        max_epoch=args.epoch,
+        step_per_epoch=args.step_per_epoch,
+        step_per_collect=args.step_per_collect,
+        episode_per_test=args.test_num,
+        batch_size=args.batch_size,
         train_fn=train_fn,
         test_fn=test_fn,
         stop_fn=stop_fn,
-        save_fn=save_fn,
+        save_best_fn=save_best_fn,
         logger=logger,
         update_per_step=args.update_per_step,
-        test_in_train=False
-    )
+        test_in_train=False,
+    ).run()
 
     pprint.pprint(result)
     watch()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     test_fqf(get_args())

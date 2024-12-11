@@ -1,47 +1,90 @@
 from copy import deepcopy
-from typing import Any, Dict, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Generic, Literal, Self, TypeVar, cast
 
+import gymnasium as gym
 import numpy as np
 import torch
 from torch.distributions import Independent, Normal
 
-from tianshou.data import Batch, ReplayBuffer, to_torch_as
+from tianshou.data import Batch, ReplayBuffer
+from tianshou.data.types import (
+    DistLogProbBatchProtocol,
+    ObsBatchProtocol,
+    RolloutBatchProtocol,
+)
 from tianshou.exploration import BaseNoise
 from tianshou.policy import DDPGPolicy
+from tianshou.policy.base import TLearningRateScheduler, TrainingStats
+from tianshou.utils.conversion import to_optional_float
+from tianshou.utils.net.continuous import ActorProb
+from tianshou.utils.optim import clone_optimizer
 
 
-class SACPolicy(DDPGPolicy):
+def correct_log_prob_gaussian_tanh(
+    log_prob: torch.Tensor,
+    tanh_squashed_action: torch.Tensor,
+    eps: float = np.finfo(np.float32).eps.item(),
+) -> torch.Tensor:
+    """Apply correction for Tanh squashing when computing `log_prob` from Gaussian.
+
+    See equation 21 in the original `SAC paper <https://arxiv.org/abs/1801.01290>`_.
+
+    :param log_prob: log probability of the action
+    :param tanh_squashed_action: action squashed to values in (-1, 1) range by tanh
+    :param eps: epsilon for numerical stability
+    """
+    log_prob_correction = torch.log(1 - tanh_squashed_action.pow(2) + eps).sum(-1, keepdim=True)
+    return log_prob - log_prob_correction
+
+
+@dataclass(kw_only=True)
+class SACTrainingStats(TrainingStats):
+    actor_loss: float
+    critic1_loss: float
+    critic2_loss: float
+    alpha: float | None = None
+    alpha_loss: float | None = None
+
+
+TSACTrainingStats = TypeVar("TSACTrainingStats", bound=SACTrainingStats)
+
+
+# TODO: the type ignore here is needed b/c the hierarchy is actually broken! Should reconsider the inheritance structure.
+class SACPolicy(DDPGPolicy[TSACTrainingStats], Generic[TSACTrainingStats]):  # type: ignore[type-var]
     """Implementation of Soft Actor-Critic. arXiv:1812.05905.
 
-    :param torch.nn.Module actor: the actor network following the rules in
-        :class:`~tianshou.policy.BasePolicy`. (s -> logits)
-    :param torch.optim.Optimizer actor_optim: the optimizer for actor network.
-    :param torch.nn.Module critic1: the first critic network. (s, a -> Q(s, a))
-    :param torch.optim.Optimizer critic1_optim: the optimizer for the first
-        critic network.
-    :param torch.nn.Module critic2: the second critic network. (s, a -> Q(s, a))
-    :param torch.optim.Optimizer critic2_optim: the optimizer for the second
-        critic network.
-    :param float tau: param for soft update of the target network. Default to 0.005.
-    :param float gamma: discount factor, in [0, 1]. Default to 0.99.
-    :param (float, torch.Tensor, torch.optim.Optimizer) or float alpha: entropy
-        regularization coefficient. Default to 0.2.
-        If a tuple (target_entropy, log_alpha, alpha_optim) is provided, then
-        alpha is automatically tuned.
-    :param bool reward_normalization: normalize the reward to Normal(0, 1).
-        Default to False.
-    :param BaseNoise exploration_noise: add a noise to action for exploration.
-        Default to None. This is useful when solving hard-exploration problem.
-    :param bool deterministic_eval: whether to use deterministic action (mean
-        of Gaussian policy) instead of stochastic action sampled by the policy.
-        Default to True.
-    :param bool action_scaling: whether to map actions from range [-1, 1] to range
-        [action_spaces.low, action_spaces.high]. Default to True.
-    :param str action_bound_method: method to bound action to range [-1, 1], can be
-        either "clip" (for simply clipping the action) or empty string for no bounding.
-        Default to "clip".
-    :param Optional[gym.Space] action_space: env's action space, mandatory if you want
-        to use option "action_scaling" or "action_bound_method". Default to None.
+    :param actor: the actor network following the rules (s -> dist_input_BD)
+    :param actor_optim: the optimizer for actor network.
+    :param critic: the first critic network. (s, a -> Q(s, a))
+    :param critic_optim: the optimizer for the first critic network.
+    :param action_space: Env's action space. Should be gym.spaces.Box.
+    :param critic2: the second critic network. (s, a -> Q(s, a)).
+        If None, use the same network as critic (via deepcopy).
+    :param critic2_optim: the optimizer for the second critic network.
+        If None, clone critic_optim to use for critic2.parameters().
+    :param tau: param for soft update of the target network.
+    :param gamma: discount factor, in [0, 1].
+    :param alpha: entropy regularization coefficient.
+        If a tuple (target_entropy, log_alpha, alpha_optim) is provided,
+        then alpha is automatically tuned.
+    :param estimation_step: The number of steps to look ahead.
+    :param exploration_noise: add noise to action for exploration.
+        This is useful when solving "hard exploration" problems.
+        "default" is equivalent to GaussianNoise(sigma=0.1).
+    :param deterministic_eval: whether to use deterministic action
+        (mode of Gaussian policy) in evaluation mode instead of stochastic
+        action sampled by the policy. Does not affect training.
+    :param action_scaling: whether to map actions from range [-1, 1]
+        to range[action_spaces.low, action_spaces.high].
+    :param action_bound_method: method to bound action to range [-1, 1],
+        can be either "clip" (for simply clipping the action)
+        or empty string for no bounding. Only used if the action_space is continuous.
+        This parameter is ignored in SAC, which used tanh squashing after sampling
+        unbounded from the gaussian policy (as in (arXiv 1801.01290): Equation 21.).
+    :param observation_space: Env's observation space.
+    :param lr_scheduler: a learning rate scheduler that adjusts the learning rate
+        in optimizer in each policy.update()
 
     .. seealso::
 
@@ -51,144 +94,169 @@ class SACPolicy(DDPGPolicy):
 
     def __init__(
         self,
-        actor: torch.nn.Module,
+        *,
+        actor: torch.nn.Module | ActorProb,
         actor_optim: torch.optim.Optimizer,
-        critic1: torch.nn.Module,
-        critic1_optim: torch.optim.Optimizer,
-        critic2: torch.nn.Module,
-        critic2_optim: torch.optim.Optimizer,
+        critic: torch.nn.Module,
+        critic_optim: torch.optim.Optimizer,
+        action_space: gym.Space,
+        critic2: torch.nn.Module | None = None,
+        critic2_optim: torch.optim.Optimizer | None = None,
         tau: float = 0.005,
         gamma: float = 0.99,
-        alpha: Union[float, Tuple[float, torch.Tensor, torch.optim.Optimizer]] = 0.2,
-        reward_normalization: bool = False,
+        alpha: float | tuple[float, torch.Tensor, torch.optim.Optimizer] = 0.2,
         estimation_step: int = 1,
-        exploration_noise: Optional[BaseNoise] = None,
+        exploration_noise: BaseNoise | Literal["default"] | None = None,
         deterministic_eval: bool = True,
-        **kwargs: Any,
+        action_scaling: bool = True,
+        action_bound_method: Literal["clip"] | None = "clip",
+        observation_space: gym.Space | None = None,
+        lr_scheduler: TLearningRateScheduler | None = None,
     ) -> None:
         super().__init__(
-            None, None, None, None, tau, gamma, exploration_noise,
-            reward_normalization, estimation_step, **kwargs
+            actor=actor,
+            actor_optim=actor_optim,
+            critic=critic,
+            critic_optim=critic_optim,
+            action_space=action_space,
+            tau=tau,
+            gamma=gamma,
+            exploration_noise=exploration_noise,
+            estimation_step=estimation_step,
+            action_scaling=action_scaling,
+            action_bound_method=action_bound_method,
+            observation_space=observation_space,
+            lr_scheduler=lr_scheduler,
         )
-        self.actor, self.actor_optim = actor, actor_optim
-        self.critic1, self.critic1_old = critic1, deepcopy(critic1)
-        self.critic1_old.eval()
-        self.critic1_optim = critic1_optim
+        critic2 = critic2 or deepcopy(critic)
+        critic2_optim = critic2_optim or clone_optimizer(critic_optim, critic2.parameters())
         self.critic2, self.critic2_old = critic2, deepcopy(critic2)
         self.critic2_old.eval()
         self.critic2_optim = critic2_optim
+        self.deterministic_eval = deterministic_eval
 
-        self._is_auto_alpha = False
-        self._alpha: Union[float, torch.Tensor]
-        if isinstance(alpha, tuple):
-            self._is_auto_alpha = True
-            self._target_entropy, self._log_alpha, self._alpha_optim = alpha
-            assert alpha[1].shape == torch.Size([1]) and alpha[1].requires_grad
-            self._alpha = self._log_alpha.detach().exp()
+        self.alpha: float | torch.Tensor
+        self._is_auto_alpha = not isinstance(alpha, float)
+        if self._is_auto_alpha:
+            # TODO: why doesn't mypy understand that this must be a tuple?
+            alpha = cast(tuple[float, torch.Tensor, torch.optim.Optimizer], alpha)
+            if alpha[1].shape != torch.Size([1]):
+                raise ValueError(
+                    f"Expected log_alpha to have shape torch.Size([1]), "
+                    f"but got {alpha[1].shape} instead.",
+                )
+            if not alpha[1].requires_grad:
+                raise ValueError("Expected log_alpha to require gradient, but it doesn't.")
+
+            self.target_entropy, self.log_alpha, self.alpha_optim = alpha
+            self.alpha = self.log_alpha.detach().exp()
         else:
-            self._alpha = alpha
+            alpha = cast(
+                float,
+                alpha,
+            )  # can we convert alpha to a constant tensor here? then mypy wouldn't complain
+            self.alpha = alpha
 
-        self._deterministic_eval = deterministic_eval
-        self.__eps = np.finfo(np.float32).eps.item()
+        # TODO or not TODO: add to BasePolicy?
+        self._check_field_validity()
 
-    def train(self, mode: bool = True) -> "SACPolicy":
+    def _check_field_validity(self) -> None:
+        if not isinstance(self.action_space, gym.spaces.Box):
+            raise ValueError(
+                f"SACPolicy only supports gym.spaces.Box, but got {self.action_space=}."
+                f"Please use DiscreteSACPolicy for discrete action spaces.",
+            )
+
+    @property
+    def is_auto_alpha(self) -> bool:
+        return self._is_auto_alpha
+
+    def train(self, mode: bool = True) -> Self:
         self.training = mode
         self.actor.train(mode)
-        self.critic1.train(mode)
+        self.critic.train(mode)
         self.critic2.train(mode)
         return self
 
     def sync_weight(self) -> None:
-        self.soft_update(self.critic1_old, self.critic1, self.tau)
+        self.soft_update(self.critic_old, self.critic, self.tau)
         self.soft_update(self.critic2_old, self.critic2, self.tau)
 
+    # TODO: violates Liskov substitution principle
     def forward(  # type: ignore
         self,
-        batch: Batch,
-        state: Optional[Union[dict, Batch, np.ndarray]] = None,
-        input: str = "obs",
+        batch: ObsBatchProtocol,
+        state: dict | Batch | np.ndarray | None = None,
         **kwargs: Any,
-    ) -> Batch:
-        obs = batch[input]
-        logits, hidden = self.actor(obs, state=state, info=batch.info)
-        assert isinstance(logits, tuple)
-        dist = Independent(Normal(*logits), 1)
-        if self._deterministic_eval and not self.training:
-            act = logits[0]
+    ) -> DistLogProbBatchProtocol:
+        (loc_B, scale_B), hidden_BH = self.actor(batch.obs, state=state, info=batch.info)
+        dist = Independent(Normal(loc=loc_B, scale=scale_B), 1)
+        if self.deterministic_eval and not self.is_within_training_step:
+            act_B = dist.mode
         else:
-            act = dist.rsample()
-        log_prob = dist.log_prob(act).unsqueeze(-1)
-        # apply correction for Tanh squashing when computing logprob from Gaussian
-        # You can check out the original SAC paper (arXiv 1801.01290): Eq 21.
-        # in appendix C to get some understanding of this equation.
-        if self.action_scaling and self.action_space is not None:
-            action_scale = to_torch_as(
-                (self.action_space.high - self.action_space.low) / 2.0, act
-            )
-        else:
-            action_scale = 1.0  # type: ignore
-        squashed_action = torch.tanh(act)
-        log_prob = log_prob - torch.log(
-            action_scale * (1 - squashed_action.pow(2)) + self.__eps
-        ).sum(-1, keepdim=True)
-        return Batch(
-            logits=logits,
+            act_B = dist.rsample()
+        log_prob = dist.log_prob(act_B).unsqueeze(-1)
+
+        squashed_action = torch.tanh(act_B)
+        log_prob = correct_log_prob_gaussian_tanh(log_prob, squashed_action)
+        result = Batch(
+            logits=(loc_B, scale_B),
             act=squashed_action,
-            state=hidden,
+            state=hidden_BH,
             dist=dist,
-            log_prob=log_prob
+            log_prob=log_prob,
         )
+        return cast(DistLogProbBatchProtocol, result)
 
     def _target_q(self, buffer: ReplayBuffer, indices: np.ndarray) -> torch.Tensor:
-        batch = buffer[indices]  # batch.obs: s_{t+n}
-        obs_next_result = self(batch, input="obs_next")
+        obs_next_batch = Batch(
+            obs=buffer[indices].obs_next,
+            info=[None] * len(indices),
+        )  # obs_next: s_{t+n}
+        obs_next_result = self(obs_next_batch)
         act_ = obs_next_result.act
-        target_q = torch.min(
-            self.critic1_old(batch.obs_next, act_),
-            self.critic2_old(batch.obs_next, act_),
-        ) - self._alpha * obs_next_result.log_prob
-        return target_q
+        return (
+            torch.min(
+                self.critic_old(obs_next_batch.obs, act_),
+                self.critic2_old(obs_next_batch.obs, act_),
+            )
+            - self.alpha * obs_next_result.log_prob
+        )
 
-    def learn(self, batch: Batch, **kwargs: Any) -> Dict[str, float]:
+    def learn(self, batch: RolloutBatchProtocol, *args: Any, **kwargs: Any) -> TSACTrainingStats:  # type: ignore
         # critic 1&2
-        td1, critic1_loss = self._mse_optimizer(
-            batch, self.critic1, self.critic1_optim
-        )
-        td2, critic2_loss = self._mse_optimizer(
-            batch, self.critic2, self.critic2_optim
-        )
+        td1, critic1_loss = self._mse_optimizer(batch, self.critic, self.critic_optim)
+        td2, critic2_loss = self._mse_optimizer(batch, self.critic2, self.critic2_optim)
         batch.weight = (td1 + td2) / 2.0  # prio-buffer
 
         # actor
         obs_result = self(batch)
         act = obs_result.act
-        current_q1a = self.critic1(batch.obs, act).flatten()
+        current_q1a = self.critic(batch.obs, act).flatten()
         current_q2a = self.critic2(batch.obs, act).flatten()
         actor_loss = (
-            self._alpha * obs_result.log_prob.flatten() -
-            torch.min(current_q1a, current_q2a)
+            self.alpha * obs_result.log_prob.flatten() - torch.min(current_q1a, current_q2a)
         ).mean()
         self.actor_optim.zero_grad()
         actor_loss.backward()
         self.actor_optim.step()
+        alpha_loss = None
 
-        if self._is_auto_alpha:
-            log_prob = obs_result.log_prob.detach() + self._target_entropy
-            alpha_loss = -(self._log_alpha * log_prob).mean()
-            self._alpha_optim.zero_grad()
+        if self.is_auto_alpha:
+            log_prob = obs_result.log_prob.detach() + self.target_entropy
+            # please take a look at issue #258 if you'd like to change this line
+            alpha_loss = -(self.log_alpha * log_prob).mean()
+            self.alpha_optim.zero_grad()
             alpha_loss.backward()
-            self._alpha_optim.step()
-            self._alpha = self._log_alpha.detach().exp()
+            self.alpha_optim.step()
+            self.alpha = self.log_alpha.detach().exp()
 
         self.sync_weight()
 
-        result = {
-            "loss/actor": actor_loss.item(),
-            "loss/critic1": critic1_loss.item(),
-            "loss/critic2": critic2_loss.item(),
-        }
-        if self._is_auto_alpha:
-            result["loss/alpha"] = alpha_loss.item()
-            result["alpha"] = self._alpha.item()  # type: ignore
-
-        return result
+        return SACTrainingStats(  # type: ignore[return-value]
+            actor_loss=actor_loss.item(),
+            critic1_loss=critic1_loss.item(),
+            critic2_loss=critic2_loss.item(),
+            alpha=to_optional_float(self.alpha),
+            alpha_loss=to_optional_float(alpha_loss),
+        )

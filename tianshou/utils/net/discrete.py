@@ -1,4 +1,5 @@
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -6,124 +7,122 @@ import torch.nn.functional as F
 from torch import nn
 
 from tianshou.data import Batch, to_torch
-from tianshou.utils.net.common import MLP
+from tianshou.utils.net.common import MLP, BaseActor, Net, TActionShape, get_output_dim
 
 
-class Actor(nn.Module):
-    """Simple actor network.
+class Actor(BaseActor):
+    """Simple actor network for discrete action spaces.
 
-    Will create an actor operated in discrete action space with structure of
-    preprocess_net ---> action_shape.
-
-    :param preprocess_net: a self-defined preprocess_net which output a
-        flattened hidden state.
+    :param preprocess_net: a self-defined preprocess_net. Typically, an instance of
+        :class:`~tianshou.utils.net.common.Net`.
     :param action_shape: a sequence of int for the shape of action.
     :param hidden_sizes: a sequence of int for constructing the MLP after
         preprocess_net. Default to empty sequence (where the MLP now contains
         only a single linear layer).
-    :param bool softmax_output: whether to apply a softmax layer over the last
+    :param softmax_output: whether to apply a softmax layer over the last
         layer's output.
-    :param int preprocess_net_output_dim: the output dimension of
-        preprocess_net.
+    :param preprocess_net_output_dim: the output dimension of
+        `preprocess_net`. Only used when `preprocess_net` does not have the attribute `output_dim`.
 
     For advanced usage (how to customize the network), please refer to
     :ref:`build_the_network`.
-
-    .. seealso::
-
-        Please refer to :class:`~tianshou.utils.net.common.Net` as an instance
-        of how preprocess_net is suggested to be defined.
     """
 
     def __init__(
         self,
-        preprocess_net: nn.Module,
-        action_shape: Sequence[int],
+        preprocess_net: nn.Module | Net,
+        action_shape: TActionShape,
         hidden_sizes: Sequence[int] = (),
         softmax_output: bool = True,
-        preprocess_net_output_dim: Optional[int] = None,
-        device: Union[str, int, torch.device] = "cpu",
+        preprocess_net_output_dim: int | None = None,
+        device: str | int | torch.device = "cpu",
     ) -> None:
         super().__init__()
+        # TODO: reduce duplication with continuous.py. Probably introducing
+        #   base classes is a good idea.
         self.device = device
         self.preprocess = preprocess_net
         self.output_dim = int(np.prod(action_shape))
-        input_dim = getattr(preprocess_net, "output_dim", preprocess_net_output_dim)
+        input_dim = get_output_dim(preprocess_net, preprocess_net_output_dim)
         self.last = MLP(
-            input_dim,  # type: ignore
+            input_dim,
             self.output_dim,
             hidden_sizes,
-            device=self.device
+            device=self.device,
         )
         self.softmax_output = softmax_output
 
+    def get_preprocess_net(self) -> nn.Module:
+        return self.preprocess
+
+    def get_output_dim(self) -> int:
+        return self.output_dim
+
     def forward(
         self,
-        obs: Union[np.ndarray, torch.Tensor],
+        obs: np.ndarray | torch.Tensor,
         state: Any = None,
-        info: Dict[str, Any] = {},
-    ) -> Tuple[torch.Tensor, Any]:
-        r"""Mapping: s -> Q(s, \*)."""
-        logits, hidden = self.preprocess(obs, state)
-        logits = self.last(logits)
+        info: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        r"""Mapping: s_B -> action_values_BA, hidden_state_BH | None.
+
+        Returns a tensor representing the values of each action, i.e, of shape
+        `(n_actions, )`, and
+        a hidden state (which may be None). If `self.softmax_output` is True, they are the
+        probabilities for taking each action. Otherwise, they will be action values.
+        The hidden state is only
+        not None if a recurrent net is used as part of the learning algorithm.
+        """
+        x, hidden_BH = self.preprocess(obs, state)
+        x = self.last(x)
         if self.softmax_output:
-            logits = F.softmax(logits, dim=-1)
-        return logits, hidden
+            x = F.softmax(x, dim=-1)
+        # If we computed softmax, output is probabilities, otherwise it's the non-normalized action values
+        output_BA = x
+        return output_BA, hidden_BH
 
 
 class Critic(nn.Module):
-    """Simple critic network. Will create an actor operated in discrete \
-    action space with structure of preprocess_net ---> 1(q value).
+    """Simple critic network for discrete action spaces.
 
-    :param preprocess_net: a self-defined preprocess_net which output a
-        flattened hidden state.
+    :param preprocess_net: a self-defined preprocess_net. Typically, an instance of
+        :class:`~tianshou.utils.net.common.Net`.
     :param hidden_sizes: a sequence of int for constructing the MLP after
         preprocess_net. Default to empty sequence (where the MLP now contains
         only a single linear layer).
-    :param int last_size: the output dimension of Critic network. Default to 1.
-    :param int preprocess_net_output_dim: the output dimension of
-        preprocess_net.
+    :param last_size: the output dimension of Critic network. Default to 1.
+    :param preprocess_net_output_dim: the output dimension of
+        `preprocess_net`. Only used when `preprocess_net` does not have the attribute `output_dim`.
 
     For advanced usage (how to customize the network), please refer to
-    :ref:`build_the_network`.
-
-    .. seealso::
-
-        Please refer to :class:`~tianshou.utils.net.common.Net` as an instance
-        of how preprocess_net is suggested to be defined.
+    :ref:`build_the_network`..
     """
 
     def __init__(
         self,
-        preprocess_net: nn.Module,
+        preprocess_net: nn.Module | Net,
         hidden_sizes: Sequence[int] = (),
         last_size: int = 1,
-        preprocess_net_output_dim: Optional[int] = None,
-        device: Union[str, int, torch.device] = "cpu",
+        preprocess_net_output_dim: int | None = None,
+        device: str | int | torch.device = "cpu",
     ) -> None:
         super().__init__()
         self.device = device
         self.preprocess = preprocess_net
         self.output_dim = last_size
-        input_dim = getattr(preprocess_net, "output_dim", preprocess_net_output_dim)
-        self.last = MLP(
-            input_dim,  # type: ignore
-            last_size,
-            hidden_sizes,
-            device=self.device
-        )
+        input_dim = get_output_dim(preprocess_net, preprocess_net_output_dim)
+        self.last = MLP(input_dim, last_size, hidden_sizes, device=self.device)
 
-    def forward(
-        self, obs: Union[np.ndarray, torch.Tensor], **kwargs: Any
-    ) -> torch.Tensor:
-        """Mapping: s -> V(s)."""
+    # TODO: make a proper interface!
+    def forward(self, obs: np.ndarray | torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Mapping: s_B -> V(s)_B."""
+        # TODO: don't use this mechanism for passing state
         logits, _ = self.preprocess(obs, state=kwargs.get("state", None))
         return self.last(logits)
 
 
 class CosineEmbeddingNetwork(nn.Module):
-    """Cosine embedding network for IQN. Convert a scalar in [0, 1] to a list \
-    of n-dim vectors.
+    """Cosine embedding network for IQN. Convert a scalar in [0, 1] to a list of n-dim vectors.
 
     :param num_cosines: the number of cosines used for the embedding.
     :param embedding_dim: the dimension of the embedding/output.
@@ -145,14 +144,18 @@ class CosineEmbeddingNetwork(nn.Module):
         N = taus.shape[1]
         # Calculate i * \pi (i=1,...,N).
         i_pi = np.pi * torch.arange(
-            start=1, end=self.num_cosines + 1, dtype=taus.dtype, device=taus.device
+            start=1,
+            end=self.num_cosines + 1,
+            dtype=taus.dtype,
+            device=taus.device,
         ).view(1, 1, self.num_cosines)
         # Calculate cos(i * \pi * \tau).
-        cosines = torch.cos(taus.view(batch_size, N, 1) * i_pi
-                            ).view(batch_size * N, self.num_cosines)
+        cosines = torch.cos(taus.view(batch_size, N, 1) * i_pi).view(
+            batch_size * N,
+            self.num_cosines,
+        )
         # Calculate embeddings of taus.
-        tau_embeddings = self.net(cosines).view(batch_size, N, self.embedding_dim)
-        return tau_embeddings
+        return self.net(cosines).view(batch_size, N, self.embedding_dim)
 
 
 class ImplicitQuantileNetwork(Critic):
@@ -160,13 +163,13 @@ class ImplicitQuantileNetwork(Critic):
 
     :param preprocess_net: a self-defined preprocess_net which output a
         flattened hidden state.
-    :param int action_dim: the dimension of action space.
+    :param action_shape: a sequence of int for the shape of action.
     :param hidden_sizes: a sequence of int for constructing the MLP after
         preprocess_net. Default to empty sequence (where the MLP now contains
         only a single linear layer).
-    :param int num_cosines: the number of cosines to use for cosine embedding.
+    :param num_cosines: the number of cosines to use for cosine embedding.
         Default to 64.
-    :param int preprocess_net_output_dim: the output dimension of
+    :param preprocess_net_output_dim: the output dimension of
         preprocess_net.
 
     .. note::
@@ -180,36 +183,34 @@ class ImplicitQuantileNetwork(Critic):
     def __init__(
         self,
         preprocess_net: nn.Module,
-        action_shape: Sequence[int],
+        action_shape: TActionShape,
         hidden_sizes: Sequence[int] = (),
         num_cosines: int = 64,
-        preprocess_net_output_dim: Optional[int] = None,
-        device: Union[str, int, torch.device] = "cpu"
+        preprocess_net_output_dim: int | None = None,
+        device: str | int | torch.device = "cpu",
     ) -> None:
-        last_size = np.prod(action_shape)
-        super().__init__(
-            preprocess_net, hidden_sizes, last_size, preprocess_net_output_dim, device
+        last_size = int(np.prod(action_shape))
+        super().__init__(preprocess_net, hidden_sizes, last_size, preprocess_net_output_dim, device)
+        self.input_dim = get_output_dim(preprocess_net, preprocess_net_output_dim)
+        self.embed_model = CosineEmbeddingNetwork(num_cosines, self.input_dim).to(
+            device,
         )
-        self.input_dim = getattr(
-            preprocess_net, "output_dim", preprocess_net_output_dim
-        )
-        self.embed_model = CosineEmbeddingNetwork(
-            num_cosines,
-            self.input_dim  # type: ignore
-        ).to(device)
 
     def forward(  # type: ignore
-        self, obs: Union[np.ndarray, torch.Tensor], sample_size: int, **kwargs: Any
-    ) -> Tuple[Any, torch.Tensor]:
+        self,
+        obs: np.ndarray | torch.Tensor,
+        sample_size: int,
+        **kwargs: Any,
+    ) -> tuple[Any, torch.Tensor]:
         r"""Mapping: s -> Q(s, \*)."""
         logits, hidden = self.preprocess(obs, state=kwargs.get("state", None))
         # Sample fractions.
         batch_size = logits.size(0)
-        taus = torch.rand(
-            batch_size, sample_size, dtype=logits.dtype, device=logits.device
+        taus = torch.rand(batch_size, sample_size, dtype=logits.dtype, device=logits.device)
+        embedding = (logits.unsqueeze(1) * self.embed_model(taus)).view(
+            batch_size * sample_size,
+            -1,
         )
-        embedding = (logits.unsqueeze(1) *
-                     self.embed_model(taus)).view(batch_size * sample_size, -1)
         out = self.last(embedding).view(batch_size, sample_size, -1).transpose(1, 2)
         return (out, taus), hidden
 
@@ -235,8 +236,9 @@ class FractionProposalNetwork(nn.Module):
         self.embedding_dim = embedding_dim
 
     def forward(
-        self, obs_embeddings: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        obs_embeddings: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Calculate (log of) probabilities q_i in the paper.
         dist = torch.distributions.Categorical(logits=self.net(obs_embeddings))
         taus_1_N = torch.cumsum(dist.probs, dim=1)
@@ -254,13 +256,13 @@ class FullQuantileFunction(ImplicitQuantileNetwork):
 
     :param preprocess_net: a self-defined preprocess_net which output a
         flattened hidden state.
-    :param int action_dim: the dimension of action space.
+    :param action_shape: a sequence of int for the shape of action.
     :param hidden_sizes: a sequence of int for constructing the MLP after
         preprocess_net. Default to empty sequence (where the MLP now contains
         only a single linear layer).
-    :param int num_cosines: the number of cosines to use for cosine embedding.
+    :param num_cosines: the number of cosines to use for cosine embedding.
         Default to 64.
-    :param int preprocess_net_output_dim: the output dimension of
+    :param preprocess_net_output_dim: the output dimension of
         preprocess_net.
 
     .. note::
@@ -272,33 +274,33 @@ class FullQuantileFunction(ImplicitQuantileNetwork):
     def __init__(
         self,
         preprocess_net: nn.Module,
-        action_shape: Sequence[int],
+        action_shape: TActionShape,
         hidden_sizes: Sequence[int] = (),
         num_cosines: int = 64,
-        preprocess_net_output_dim: Optional[int] = None,
-        device: Union[str, int, torch.device] = "cpu",
+        preprocess_net_output_dim: int | None = None,
+        device: str | int | torch.device = "cpu",
     ) -> None:
         super().__init__(
-            preprocess_net, action_shape, hidden_sizes, num_cosines,
-            preprocess_net_output_dim, device
+            preprocess_net,
+            action_shape,
+            hidden_sizes,
+            num_cosines,
+            preprocess_net_output_dim,
+            device,
         )
 
-    def _compute_quantiles(
-        self, obs: torch.Tensor, taus: torch.Tensor
-    ) -> torch.Tensor:
+    def _compute_quantiles(self, obs: torch.Tensor, taus: torch.Tensor) -> torch.Tensor:
         batch_size, sample_size = taus.shape
-        embedding = (obs.unsqueeze(1) *
-                     self.embed_model(taus)).view(batch_size * sample_size, -1)
-        quantiles = self.last(embedding).view(batch_size, sample_size,
-                                              -1).transpose(1, 2)
-        return quantiles
+        embedding = (obs.unsqueeze(1) * self.embed_model(taus)).view(batch_size * sample_size, -1)
+        return self.last(embedding).view(batch_size, sample_size, -1).transpose(1, 2)
 
     def forward(  # type: ignore
-        self, obs: Union[np.ndarray, torch.Tensor],
+        self,
+        obs: np.ndarray | torch.Tensor,
         propose_model: FractionProposalNetwork,
-        fractions: Optional[Batch] = None,
-        **kwargs: Any
-    ) -> Tuple[Any, torch.Tensor]:
+        fractions: Batch | None = None,
+        **kwargs: Any,
+    ) -> tuple[Any, torch.Tensor]:
         r"""Mapping: s -> Q(s, \*)."""
         logits, hidden = self.preprocess(obs, state=kwargs.get("state", None))
         # Propose fractions
@@ -319,9 +321,9 @@ class FullQuantileFunction(ImplicitQuantileNetwork):
 class NoisyLinear(nn.Module):
     """Implementation of Noisy Networks. arXiv:1706.10295.
 
-    :param int in_features: the number of input features.
-    :param int out_features: the number of output features.
-    :param float noisy_std: initial standard deviation of noisy linear layers.
+    :param in_features: the number of input features.
+    :param out_features: the number of output features.
+    :param noisy_std: initial standard deviation of noisy linear layers.
 
     .. note::
 
@@ -329,9 +331,7 @@ class NoisyLinear(nn.Module):
         /fqf_iqn_qrdqn/network.py .
     """
 
-    def __init__(
-        self, in_features: int, out_features: int, noisy_std: float = 0.5
-    ) -> None:
+    def __init__(self, in_features: int, out_features: int, noisy_std: float = 0.5) -> None:
         super().__init__()
 
         # Learnable parameters.
@@ -341,8 +341,8 @@ class NoisyLinear(nn.Module):
         self.sigma_bias = nn.Parameter(torch.FloatTensor(out_features))
 
         # Factorized noise parameters.
-        self.register_buffer('eps_p', torch.FloatTensor(in_features))
-        self.register_buffer('eps_q', torch.FloatTensor(out_features))
+        self.register_buffer("eps_p", torch.FloatTensor(in_features))
+        self.register_buffer("eps_q", torch.FloatTensor(out_features))
 
         self.in_features = in_features
         self.out_features = out_features
@@ -362,16 +362,15 @@ class NoisyLinear(nn.Module):
         x = torch.randn(x.size(0), device=x.device)
         return x.sign().mul_(x.abs().sqrt_())
 
+    # TODO: rename or change functionality? Usually sample is not an inplace operation...
     def sample(self) -> None:
-        self.eps_p.copy_(self.f(self.eps_p))  # type: ignore
-        self.eps_q.copy_(self.f(self.eps_q))  # type: ignore
+        self.eps_p.copy_(self.f(self.eps_p))
+        self.eps_q.copy_(self.f(self.eps_q))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training:
-            weight = self.mu_W + self.sigma_W * (
-                self.eps_q.ger(self.eps_p)  # type: ignore
-            )
-            bias = self.mu_bias + self.sigma_bias * self.eps_q.clone()  # type: ignore
+            weight = self.mu_W + self.sigma_W * (self.eps_q.ger(self.eps_p))
+            bias = self.mu_bias + self.sigma_bias * self.eps_q.clone()
         else:
             weight = self.mu_W
             bias = self.mu_bias
@@ -379,28 +378,13 @@ class NoisyLinear(nn.Module):
         return F.linear(x, weight, bias)
 
 
-def sample_noise(model: nn.Module) -> bool:
-    """Sample the random noises of NoisyLinear modules in the model.
-
-    :param model: a PyTorch module which may have NoisyLinear submodules.
-    :returns: True if model has at least one NoisyLinear submodule;
-        otherwise, False.
-    """
-    done = False
-    for m in model.modules():
-        if isinstance(m, NoisyLinear):
-            m.sample()
-            done = True
-    return done
-
-
 class IntrinsicCuriosityModule(nn.Module):
     """Implementation of Intrinsic Curiosity Module. arXiv:1705.05363.
 
-    :param torch.nn.Module feature_net: a self-defined feature_net which output a
+    :param feature_net: a self-defined feature_net which output a
         flattened hidden state.
-    :param int feature_dim: input dimension of the feature net.
-    :param int action_dim: dimension of the action space.
+    :param feature_dim: input dimension of the feature net.
+    :param action_dim: dimension of the action space.
     :param hidden_sizes: hidden layer sizes for forward and inverse models.
     :param device: device for the module.
     """
@@ -411,7 +395,7 @@ class IntrinsicCuriosityModule(nn.Module):
         feature_dim: int,
         action_dim: int,
         hidden_sizes: Sequence[int] = (),
-        device: Union[str, torch.device] = "cpu"
+        device: str | torch.device = "cpu",
     ) -> None:
         super().__init__()
         self.feature_net = feature_net
@@ -419,30 +403,32 @@ class IntrinsicCuriosityModule(nn.Module):
             feature_dim + action_dim,
             output_dim=feature_dim,
             hidden_sizes=hidden_sizes,
-            device=device
+            device=device,
         )
         self.inverse_model = MLP(
             feature_dim * 2,
             output_dim=action_dim,
             hidden_sizes=hidden_sizes,
-            device=device
+            device=device,
         )
         self.feature_dim = feature_dim
         self.action_dim = action_dim
         self.device = device
 
     def forward(
-        self, s1: Union[np.ndarray, torch.Tensor],
-        act: Union[np.ndarray, torch.Tensor], s2: Union[np.ndarray,
-                                                        torch.Tensor], **kwargs: Any
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        s1: np.ndarray | torch.Tensor,
+        act: np.ndarray | torch.Tensor,
+        s2: np.ndarray | torch.Tensor,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         r"""Mapping: s1, act, s2 -> mse_loss, act_hat."""
         s1 = to_torch(s1, dtype=torch.float32, device=self.device)
         s2 = to_torch(s2, dtype=torch.float32, device=self.device)
         phi1, phi2 = self.feature_net(s1), self.feature_net(s2)
         act = to_torch(act, dtype=torch.long, device=self.device)
         phi2_hat = self.forward_model(
-            torch.cat([phi1, F.one_hot(act, num_classes=self.action_dim)], dim=1)
+            torch.cat([phi1, F.one_hot(act, num_classes=self.action_dim)], dim=1),
         )
         mse_loss = 0.5 * F.mse_loss(phi2_hat, phi2, reduction="none").sum(1)
         act_hat = self.inverse_model(torch.cat([phi1, phi2], dim=1))

@@ -1,9 +1,17 @@
 from typing import Any
 
 import cloudpickle
+import gymnasium
+import numpy as np
+
+from tianshou.env.pettingzoo_env import PettingZooEnv
+
+ENV_TYPE = gymnasium.Env | PettingZooEnv
+
+gym_new_venv_step_type = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 
 
-class CloudpickleWrapper(object):
+class CloudpickleWrapper:
     """A cloudpickle wrapper used in SubprocVectorEnv."""
 
     def __init__(self, data: Any) -> None:
